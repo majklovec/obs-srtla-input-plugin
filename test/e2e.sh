@@ -119,6 +119,9 @@ case_index=0
 failures=0
 passed=0
 
+# Extra SRT URL options for the sender (passphrase, streamid), set per case.
+SENDER_SRT_OPTIONS=""
+
 # stream CASE HARNESS_SECONDS "EXTRA HARNESS OPTIONS" CLIP...
 stream() {
 	local name=$1 seconds=$2 options=$3
@@ -143,7 +146,7 @@ stream() {
 	for clip in "$@"; do
 		# Fails by design when the source is destroyed mid-stream.
 		timeout "$seconds" ffmpeg -hide_banner -loglevel error -re -i "$WORK_DIR/clips/$clip.ts" -c copy \
-			-f mpegts "srt://127.0.0.1:$sender_port?pkt_size=1316&latency=200000" \
+			-f mpegts "srt://127.0.0.1:$sender_port?pkt_size=1316&latency=200000$SENDER_SRT_OPTIONS" \
 			>>"$WORK_DIR/logs/$name.ffmpeg.log" 2>&1 || true
 		sleep 1
 	done
@@ -162,6 +165,15 @@ stream() {
 	current_case=$name
 	current_log=$log
 	current_failed=0
+	SENDER_SRT_OPTIONS=""
+}
+
+# check_log PATTERN: the plugin log must contain a line matching PATTERN.
+check_log() {
+	if ! grep -q -- "$1" "$current_log"; then
+		printf '    log: expected a line matching "%s"\n' "$1"
+		current_failed=1
+	fi
 }
 
 check() {
@@ -300,6 +312,71 @@ if selected port-update-two-sources; then
 		"--initial-port $((BASE_PORT + 900)) --extra-source $((BASE_PORT + 901))" h264-aac-stereo
 	check_common 1
 	check update_ms '<=' 500
+	finish
+fi
+
+# Security: SRT AES passphrase and required stream ID.
+passphrase="e2e-secret-passphrase"
+streamid="live/e2e-publish-key"
+
+# The sender leaves the key length unset, as most SRTLA senders do; the
+# source's default (AES-256) is used.
+if selected passphrase; then
+	SENDER_SRT_OPTIONS="&passphrase=$passphrase"
+	stream passphrase "$single_clip_seconds" "--passphrase $passphrase" h264-aac-stereo
+	check_common 1
+	check_log 'SRT stream connected (AES-256 encrypted)'
+	finish
+fi
+
+# Sender and source ask for different key lengths; SRT settles on one.
+if selected passphrase-pbkeylen-mismatch; then
+	SENDER_SRT_OPTIONS="&passphrase=$passphrase&pbkeylen=16"
+	stream passphrase-pbkeylen-mismatch "$single_clip_seconds" "--passphrase $passphrase --pbkeylen 32" \
+		h264-aac-stereo
+	check_common 1
+	check_log 'SRT stream connected (AES-[0-9]* encrypted)'
+	finish
+fi
+
+if selected passphrase-wrong; then
+	SENDER_SRT_OPTIONS="&passphrase=wrong-passphrase"
+	stream passphrase-wrong 5 "--passphrase $passphrase" h264-aac-stereo
+	check exit = 0
+	check video_frames = 0
+	check_log 'SRT connection rejected before established'
+	finish
+fi
+
+# An unencrypted sender must not get through to an encrypted source.
+if selected passphrase-missing; then
+	stream passphrase-missing 5 "--passphrase $passphrase" h264-aac-stereo
+	check exit = 0
+	check video_frames = 0
+	finish
+fi
+
+if selected passphrase-invalid; then
+	stream passphrase-invalid 3 "--passphrase short" h264-aac-stereo
+	check exit = 0
+	check video_frames = 0
+	check_log 'SRT passphrase must be 10 to 79 characters'
+	finish
+fi
+
+if selected streamid; then
+	SENDER_SRT_OPTIONS="&passphrase=$passphrase&streamid=$streamid"
+	stream streamid "$single_clip_seconds" "--passphrase $passphrase --streamid $streamid" h264-aac-stereo
+	check_common 1
+	finish
+fi
+
+if selected streamid-wrong; then
+	SENDER_SRT_OPTIONS="&streamid=live/other-key"
+	stream streamid-wrong 5 "--streamid $streamid" h264-aac-stereo
+	check exit = 0
+	check video_frames = 0
+	check_log 'rejected SRT stream: stream ID "live/other-key"'
 	finish
 fi
 

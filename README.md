@@ -92,7 +92,9 @@ passes to OBS:
 The cases cover H.264/HEVC, 8/10-bit, 4:2:0/4:2:2 and the swscale fallback,
 HDR (HLG), and mono, stereo and 5.1 audio, plus downmixed 5.0 and 3.0.
 They also test reconnecting, destroying a source mid-stream, changing the
-port, and running two sources at once. The suite also fails if update or
+port, and running two sources at once. Security cases check an encrypted
+stream, mismatched key lengths, wrong, missing and invalid passphrases, and
+a matching and a wrong stream ID. The suite also fails if update or
 destroy blocks for more than 500 ms.
 
 The tests need `ffmpeg` with SRT, libx264 and libx265 support, plus the
@@ -106,16 +108,18 @@ Per-case logs are kept in `build_e2e/logs/`.
 These steps are for a native Linux OBS installation. Flatpak and Snap builds
 are sandboxed and need a package-specific plugin installation method.
 
-After building, install the module and its locale file into the per-user OBS
-plugin directory:
+After building, install the module and its locale files (English and Czech)
+into the per-user OBS plugin directory:
 
 ```sh
 PLUGIN_DIR="$HOME/.config/obs-studio/plugins/obs-srtla-source"
 install -Dm755 build_x86_64/obs-srtla-source.so \
   "$PLUGIN_DIR/bin/64bit/obs-srtla-source.so"
-install -Dm644 data/locale/en-US.ini \
-  "$PLUGIN_DIR/data/locale/en-US.ini"
+install -Dm644 -t "$PLUGIN_DIR/data/locale" data/locale/*.ini
 ```
+
+OBS shows the plugin in Czech when its interface language is set to Czech,
+and falls back to English for any missing text.
 
 Close and restart OBS after installing or updating the plugin. To remove this
 user-local installation, close OBS and remove
@@ -154,9 +158,48 @@ found`.
 
 - **SRTLA Listen Port (UDP):** port exposed to the SRTLA sender; defaults to
   `5000`. Each SRTLA source needs its own port.
+- **SRT Passphrase:** enables SRT AES encryption. The sender must be set to
+  the same passphrase (10 to 79 characters), for example
+  `srtla://<ip>:<port>?passphrase=<passphrase>` in Moblin or IRL Pro. Senders
+  with a different passphrase, and unencrypted senders, are rejected. Leave it
+  empty to accept only unencrypted streams. If the passphrase is too short or
+  too long, the source logs an error and accepts no streams.
+- **Encryption Key Length:** AES-128, AES-192, AES-256 (default), or chosen by
+  sender. It only applies when a passphrase is set. If the sender sets its own
+  key length explicitly, SRT may use the sender's value instead; the log shows
+  the key length in effect.
+- **Required Stream ID:** if set, only senders whose SRT stream ID is exactly
+  this value are accepted, e.g. `srtla://<ip>:<port>?streamid=<publish-key>`.
+  Leave it empty to accept any stream ID. This is an access key, not
+  encryption; combine it with a passphrase for confidentiality.
 
-Changing the port stops the current receiver and starts it again. The plugin
-stops its receiver and worker threads when the source is removed.
+Settings are applied when the properties dialog is confirmed. Changing any
+setting stops the current receiver and starts it again, so the sender
+reconnects under the new rules. The plugin stops its receiver and worker
+threads when the source is removed.
+
+### Security notes
+
+SRTLA itself adds no authentication or encryption; both are handled by SRT
+end to end between the sender and the plugin. The embedded SRTLA receiver only
+relays SRT packets, but it sees SRT rejections: a source IP that fails the
+passphrase or stream ID check 5 times within 60 seconds cannot register new
+SRTLA groups for 60 seconds.
+
+The OBS log shows `SRT stream connected (AES-256 encrypted)` or
+`(unencrypted)` for each stream. A wrong or missing passphrase appears as
+`srtla: ... SRT connection rejected before established`, and a wrong stream
+ID as `rejected SRT stream: stream ID "..." does not match`.
+
+### Bonded-link reordering
+
+Bonded links deliver SRT packets out of order. The plugin's SRT listener sets
+a reorder tolerance (`SRTO_LOSSMAXTTL` = 40 packets), as the BELABOX SRTLA
+documentation requires for receivers, so SRT does not request retransmission
+of packets that are only late. The plugin uses upstream Haivision libsrt
+rather than the BELABOX-patched fork, which BELABOX recommends to reduce
+retransmissions further. The SRT latency is negotiated to the larger of the
+sender's and receiver's values, so set it on the sender.
 
 ## License
 

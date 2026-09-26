@@ -14,6 +14,7 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 #include <srt/srt.h>
+#include <srt/access_control.h>
 // libsrt pulls in <syslog.h>, whose LOG_* macros shadow OBS's log levels.
 #undef LOG_ERROR
 #undef LOG_WARNING
@@ -35,10 +36,20 @@ OBS_MODULE_USE_DEFAULT_LOCALE("obs-srtla-source", "en-US")
 namespace {
 
 constexpr char setting_port[] = "srtla_port";
+constexpr char setting_passphrase[] = "srt_passphrase";
+constexpr char setting_pbkeylen[] = "srt_pbkeylen";
+constexpr char setting_streamid[] = "srt_streamid";
 constexpr uint16_t default_port = 5000;
+constexpr int default_pbkeylen = 32;
+constexpr size_t min_passphrase_length = 10;
+constexpr size_t max_passphrase_length = 79;
 constexpr int avio_buffer_size = 32 * 1024;
 // Upper bound for how long blocking SRT calls take to notice a stop request.
 constexpr int srt_timeout_ms = 250;
+// Bonded links deliver packets out of order. SRT waits for up to this many
+// later packets before reporting a gap as lost, instead of requesting a
+// retransmission immediately (BELABOX recommends 10-50 for SRTLA receivers).
+constexpr int srt_reorder_tolerance = 40;
 
 void srt_log_to_obs(void *, int level, const char *, int, const char *, const char *message)
 {
@@ -513,20 +524,88 @@ private:
 	bool downmix_logged_ = false;
 };
 
+// Settings that require restarting the receiver when they change. The
+// passphrase and stream ID apply to every SRT connection the sender makes.
+struct ReceiverConfig {
+	uint16_t port = default_port;
+	std::string passphrase;
+	int pbkeylen = default_pbkeylen;
+	std::string streamid;
+
+	bool operator==(const ReceiverConfig &other) const
+	{
+		return port == other.port && passphrase == other.passphrase && pbkeylen == other.pbkeylen &&
+		       streamid == other.streamid;
+	}
+};
+
+ReceiverConfig read_config(obs_data_t *settings)
+{
+	ReceiverConfig config;
+	const long long port = obs_data_get_int(settings, setting_port);
+	if (port >= 1 && port <= 65535)
+		config.port = static_cast<uint16_t>(port);
+	const long long pbkeylen = obs_data_get_int(settings, setting_pbkeylen);
+	if (pbkeylen == 0 || pbkeylen == 16 || pbkeylen == 24 || pbkeylen == 32)
+		config.pbkeylen = static_cast<int>(pbkeylen);
+	config.passphrase = obs_data_get_string(settings, setting_passphrase);
+	config.streamid = obs_data_get_string(settings, setting_streamid);
+	return config;
+}
+
+// The stream ID comes from the remote sender, so it is sanitized for the log.
+std::string printable(const char *text)
+{
+	std::string result;
+	for (const char *c = text; *c && result.size() < 128; ++c)
+		result += *c >= 0x20 && *c < 0x7f ? *c : '?';
+	return result;
+}
+
+// Runs in the libsrt receive thread before a connection is accepted. The
+// rejection travels back through the SRTLA relay, which also throttles
+// senders that keep failing.
+int check_stream_id(void *opaque, SRTSOCKET socket, int, const sockaddr *, const char *streamid)
+{
+	const auto &required = *static_cast<const std::string *>(opaque);
+	const char *received = streamid ? streamid : "";
+	if (required == received)
+		return 0;
+	srt_setrejectreason(socket, SRT_REJX_UNAUTHORIZED);
+	plugin_log(LOG_WARNING, "rejected SRT stream: stream ID \"%s\" does not match the required stream ID",
+		   printable(received).c_str());
+	return -1;
+}
+
 // Loopback SRT listener on an ephemeral port that the SRTLA receiver feeds.
-SRTSOCKET open_local_listener(uint16_t &port)
+// Accepted sockets inherit its encryption settings; SRT rejects senders whose
+// passphrase does not match, including unencrypted senders.
+SRTSOCKET open_local_listener(const ReceiverConfig &config, uint16_t &port)
 {
 	const SRTSOCKET listener = srt_create_socket();
 	if (listener == SRT_INVALID_SOCK) {
 		plugin_log(LOG_ERROR, "could not create local SRT socket: %s", srt_getlasterror_str());
 		return SRT_INVALID_SOCK;
 	}
+	bool ok = srt_setsockflag(listener, SRTO_RCVTIMEO, &srt_timeout_ms, sizeof(srt_timeout_ms)) != SRT_ERROR &&
+		  srt_setsockflag(listener, SRTO_LOSSMAXTTL, &srt_reorder_tolerance, sizeof(srt_reorder_tolerance)) !=
+			  SRT_ERROR;
+	if (ok && !config.passphrase.empty()) {
+		const bool enforce = true;
+		ok = srt_setsockflag(listener, SRTO_ENFORCEDENCRYPTION, &enforce, sizeof(enforce)) != SRT_ERROR &&
+		     srt_setsockflag(listener, SRTO_PASSPHRASE, config.passphrase.data(),
+				     static_cast<int>(config.passphrase.size())) != SRT_ERROR &&
+		     srt_setsockflag(listener, SRTO_PBKEYLEN, &config.pbkeylen, sizeof(config.pbkeylen)) != SRT_ERROR;
+	}
+	if (ok && !config.streamid.empty())
+		ok = srt_listen_callback(listener, check_stream_id,
+					 const_cast<std::string *>(&config.streamid)) != SRT_ERROR;
+
 	sockaddr_in address{};
 	address.sin_family = AF_INET;
 	address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 	int address_length = sizeof(address);
-	if (srt_setsockflag(listener, SRTO_RCVTIMEO, &srt_timeout_ms, sizeof(srt_timeout_ms)) == SRT_ERROR ||
-	    srt_bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == SRT_ERROR ||
+	if (!ok || srt_bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == SRT_ERROR ||
 	    srt_listen(listener, 1) == SRT_ERROR ||
 	    srt_getsockname(listener, reinterpret_cast<sockaddr *>(&address), &address_length) == SRT_ERROR) {
 		plugin_log(LOG_ERROR, "could not open local SRT listener: %s", srt_getlasterror_str());
@@ -537,10 +616,22 @@ SRTSOCKET open_local_listener(uint16_t &port)
 	return listener;
 }
 
-uint16_t configured_port(obs_data_t *settings)
+bool valid_passphrase(const std::string &passphrase)
 {
-	const long long port = obs_data_get_int(settings, setting_port);
-	return port >= 1 && port <= 65535 ? static_cast<uint16_t>(port) : default_port;
+	return passphrase.empty() ||
+	       (passphrase.size() >= min_passphrase_length && passphrase.size() <= max_passphrase_length);
+}
+
+std::string encryption_state(SRTSOCKET stream)
+{
+	int state = SRT_KM_S_UNSECURED;
+	int size = sizeof(state);
+	if (srt_getsockflag(stream, SRTO_RCVKMSTATE, &state, &size) == SRT_ERROR || state != SRT_KM_S_SECURED)
+		return "unencrypted";
+	int pbkeylen = 0;
+	size = sizeof(pbkeylen);
+	srt_getsockflag(stream, SRTO_PBKEYLEN, &pbkeylen, &size);
+	return "AES-" + std::to_string(pbkeylen * 8) + " encrypted";
 }
 
 // One OBS source: a worker thread that runs the SRTLA receiver and decodes
@@ -555,11 +646,11 @@ public:
 
 	void update(obs_data_t *settings)
 	{
-		const uint16_t port = configured_port(settings);
-		if (thread_.joinable() && port == port_)
+		ReceiverConfig config = read_config(settings);
+		if (thread_.joinable() && config == config_)
 			return;
 		stop();
-		port_ = port;
+		config_ = std::move(config);
 		stopping_ = false;
 		try {
 			thread_ = std::thread(&SrtlaSource::run, this);
@@ -589,16 +680,31 @@ private:
 
 	void serve()
 	{
+		// Refusing to start is safer than silently accepting unencrypted streams.
+		if (!valid_passphrase(config_.passphrase)) {
+			plugin_log(LOG_ERROR, "SRT passphrase must be %zu to %zu characters; not accepting streams",
+				   min_passphrase_length, max_passphrase_length);
+			return;
+		}
+
 		uint16_t srt_port = 0;
-		const SRTSOCKET listener = open_local_listener(srt_port);
+		const SRTSOCKET listener = open_local_listener(config_, srt_port);
 		if (listener == SRT_INVALID_SOCK)
 			return;
 		listener_ = listener;
 
 		srtla_embed::EmbeddedSrtlaReceiver receiver;
-		if (!receiver.start(port_, srt_port))
+		if (!receiver.start(config_.port, srt_port))
 			return;
-		plugin_log(LOG_INFO, "listening for SRTLA on UDP port %u", port_);
+		if (config_.passphrase.empty())
+			plugin_log(LOG_INFO, "SRT encryption disabled, stream ID check %s",
+				   config_.streamid.empty() ? "disabled" : "enabled");
+		else
+			plugin_log(LOG_INFO, "SRT encryption required (%s), stream ID check %s",
+				   config_.pbkeylen ? ("AES-" + std::to_string(config_.pbkeylen * 8)).c_str()
+						    : "key length chosen by sender",
+				   config_.streamid.empty() ? "disabled" : "enabled");
+		plugin_log(LOG_INFO, "listening for SRTLA on UDP port %u", config_.port);
 
 		while (!stopping_ && receiver.running()) {
 			const SRTSOCKET stream = srt_accept(listener, nullptr, nullptr);
@@ -614,7 +720,7 @@ private:
 				close_socket(stream_);
 				continue;
 			}
-			plugin_log(LOG_INFO, "SRT stream connected");
+			plugin_log(LOG_INFO, "SRT stream connected (%s)", encryption_state(stream).c_str());
 			MediaDecoder(source_).run(stream, stopping_);
 			close_socket(stream_);
 			if (!stopping_)
@@ -625,7 +731,8 @@ private:
 	}
 
 	obs_source_t *source_;
-	uint16_t port_ = default_port;
+	// Read by the worker and libsrt callbacks; replaced only while stopped.
+	ReceiverConfig config_;
 	std::atomic<bool> stopping_{false};
 	std::atomic<SRTSOCKET> listener_{SRT_INVALID_SOCK};
 	std::atomic<SRTSOCKET> stream_{SRT_INVALID_SOCK};
@@ -657,13 +764,34 @@ void source_update(void *data, obs_data_t *settings)
 obs_properties_t *source_properties(void *)
 {
 	obs_properties_t *properties = obs_properties_create();
+	// Every change restarts the receiver, so apply them only on OK, not per keystroke.
+	obs_properties_set_flags(properties, OBS_PROPERTIES_DEFER_UPDATE);
 	obs_properties_add_int(properties, setting_port, obs_module_text("Port"), 1, 65535, 1);
+
+	obs_property_t *passphrase = obs_properties_add_text(properties, setting_passphrase,
+							     obs_module_text("Passphrase"), OBS_TEXT_PASSWORD);
+	obs_property_set_long_description(passphrase, obs_module_text("Passphrase.Description"));
+
+	obs_property_t *pbkeylen = obs_properties_add_list(properties, setting_pbkeylen, obs_module_text("KeyLength"),
+							   OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(pbkeylen, obs_module_text("KeyLength.Auto"), 0);
+	obs_property_list_add_int(pbkeylen, "AES-128", 16);
+	obs_property_list_add_int(pbkeylen, "AES-192", 24);
+	obs_property_list_add_int(pbkeylen, "AES-256", 32);
+	obs_property_set_long_description(pbkeylen, obs_module_text("KeyLength.Description"));
+
+	obs_property_t *streamid = obs_properties_add_text(properties, setting_streamid, obs_module_text("StreamId"),
+							   OBS_TEXT_PASSWORD);
+	obs_property_set_long_description(streamid, obs_module_text("StreamId.Description"));
 	return properties;
 }
 
 void source_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_int(settings, setting_port, default_port);
+	obs_data_set_default_string(settings, setting_passphrase, "");
+	obs_data_set_default_int(settings, setting_pbkeylen, default_pbkeylen);
+	obs_data_set_default_string(settings, setting_streamid, "");
 }
 
 obs_source_info source_info = {

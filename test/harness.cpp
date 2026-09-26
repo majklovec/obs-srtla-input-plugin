@@ -7,9 +7,11 @@
 //
 // usage: harness PLUGIN.so --port PORT --seconds N
 //                [--initial-port PORT] [--extra-source PORT]
+//                [--passphrase TEXT] [--pbkeylen N] [--streamid TEXT]
 //   --initial-port  create the source on this port, then switch it to --port
 //                   through update() (tests port changes)
 //   --extra-source  run a second, idle source on this port at the same time
+//   --passphrase, --pbkeylen, --streamid  SRT security settings of the source
 
 #include <obs-module.h>
 
@@ -127,11 +129,18 @@ void obs_source_output_audio(obs_source_t *, const obs_source_audio *audio)
 int main(int argc, char **argv)
 {
 	const char *plugin_path = argc > 1 ? argv[1] : nullptr;
-	int port = 0, seconds = 0, initial_port = 0, extra_port = 0;
+	int port = 0, seconds = 0, initial_port = 0, extra_port = 0, pbkeylen = -1;
+	const char *passphrase = nullptr, *streamid = nullptr;
 	for (int i = 2; i + 1 < argc; i += 2) {
 		const std::string option = argv[i];
 		const int value = std::atoi(argv[i + 1]);
-		if (option == "--port")
+		if (option == "--passphrase")
+			passphrase = argv[i + 1];
+		else if (option == "--streamid")
+			streamid = argv[i + 1];
+		else if (option == "--pbkeylen")
+			pbkeylen = value;
+		else if (option == "--port")
 			port = value;
 		else if (option == "--seconds")
 			seconds = value;
@@ -142,7 +151,8 @@ int main(int argc, char **argv)
 	}
 	if (!plugin_path || port <= 0 || seconds <= 0) {
 		std::fprintf(stderr,
-			     "usage: %s PLUGIN.so --port PORT --seconds N [--initial-port PORT] [--extra-source PORT]\n",
+			     "usage: %s PLUGIN.so --port PORT --seconds N [--initial-port PORT] [--extra-source PORT] "
+			     "[--passphrase TEXT] [--pbkeylen N] [--streamid TEXT]\n",
 			     argv[0]);
 		return 2;
 	}
@@ -163,6 +173,12 @@ int main(int argc, char **argv)
 	if (plugin_source.get_defaults)
 		plugin_source.get_defaults(settings);
 	obs_data_set_int(settings, "srtla_port", initial_port ? initial_port : port);
+	if (passphrase)
+		obs_data_set_string(settings, "srt_passphrase", passphrase);
+	if (streamid)
+		obs_data_set_string(settings, "srt_streamid", streamid);
+	if (pbkeylen >= 0)
+		obs_data_set_int(settings, "srt_pbkeylen", pbkeylen);
 	void *source = plugin_source.create(settings, reinterpret_cast<obs_source_t *>(0x1));
 
 	void *extra_source = nullptr;
