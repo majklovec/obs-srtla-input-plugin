@@ -223,6 +223,9 @@ namespace
 			}
 			else
 			{
+				blog(LOG_INFO,
+					 "[obs-srtla-source] MPEG-TS opened: iformat=%s nb_streams=%u",
+					 format->iformat ? format->iformat->name : "?", format->nb_streams);
 				result = avformat_find_stream_info(format, nullptr);
 				if (result < 0)
 				{
@@ -230,6 +233,15 @@ namespace
 				}
 				else
 				{
+					for (unsigned int i = 0; i < format->nb_streams; ++i)
+					{
+						const AVCodecParameters *p = format->streams[i]->codecpar;
+						blog(LOG_INFO,
+							 "[obs-srtla-source]   stream %u: type=%d codec=%s w=%d h=%d sr=%d",
+							 i, static_cast<int>(p->codec_type),
+							 avcodec_get_name(p->codec_id), p->width, p->height,
+							 p->sample_rate);
+					}
 					result = decode(format, stopping);
 				}
 				avformat_close_input(&format);
@@ -246,6 +258,15 @@ namespace
 			char error_text[AV_ERROR_MAX_STRING_SIZE] = {};
 			av_strerror(error, error_text, sizeof(error_text));
 			blog(LOG_WARNING, "[obs-srtla-source] %s: %s", message, error_text);
+		}
+
+		// Codec errors can repeat once per packet; only the first is reported.
+		static void log_av_error_once(bool &logged, const char *message, int error)
+		{
+			if (logged)
+				return;
+			logged = true;
+			log_av_error(message, error);
 		}
 
 		AVCodecContext *create_decoder(AVFormatContext *format, int stream_index)
@@ -287,6 +308,8 @@ namespace
 			}
 			video_codec_ = create_decoder(format, video_index);
 			audio_codec_ = create_decoder(format, audio_index);
+			blog(LOG_INFO, "[obs-srtla-source] decoder: video=%s audio=%s",
+				 video_codec_ ? "ok" : "none", audio_codec_ ? "ok" : "none");
 			if (!video_codec_ && !audio_codec_)
 			{
 				blog(LOG_WARNING, "[obs-srtla-source] stream has no supported audio or video");
@@ -299,15 +322,28 @@ namespace
 				return false;
 
 			int read_result = 0;
+			uint64_t packets = 0;
 			while (!stopping.load() && (read_result = av_read_frame(format, packet.get())) >= 0)
 			{
+				if (++packets % 300 == 1)
+					blog(LOG_INFO,
+						 "[obs-srtla-source] packets demuxed: %llu (last stream_index=%d size=%d)",
+						 static_cast<unsigned long long>(packets), packet->stream_index,
+						 packet->size);
 				AVCodecContext *codec = packet->stream_index == video_index
 											? video_codec_
 										: packet->stream_index == audio_index ? audio_codec_
 																			  : nullptr;
-				if (codec && avcodec_send_packet(codec, packet.get()) >= 0)
+				int send_result = codec ? avcodec_send_packet(codec, packet.get())
+										: AVERROR(EINVAL);
+				if (codec && send_result < 0)
+					log_av_error_once(codec == video_codec_ ? video_send_logged_
+															: audio_send_logged_,
+									  "avcodec_send_packet failed", send_result);
+				if (codec && send_result >= 0)
 				{
-					while (avcodec_receive_frame(codec, frame.get()) >= 0)
+					int receive_result = 0;
+					while ((receive_result = avcodec_receive_frame(codec, frame.get())) >= 0)
 					{
 						const AVStream *stream = format->streams[packet->stream_index];
 						if (codec == video_codec_)
@@ -322,52 +358,135 @@ namespace
 														  media_origin_ns_, capture_origin_ns_));
 						av_frame_unref(frame.get());
 					}
+					if (receive_result != AVERROR(EAGAIN) && receive_result != AVERROR_EOF)
+						log_av_error_once(codec == video_codec_ ? video_receive_logged_
+																: audio_receive_logged_,
+										  "avcodec_receive_frame failed", receive_result);
 				}
 				av_packet_unref(packet.get());
 			}
 			if (read_result < 0 && !stopping.load() && read_result != AVERROR_EOF)
 				log_av_error("MPEG-TS read failed", read_result);
+			blog(LOG_INFO,
+				 "[obs-srtla-source] decode loop ended: read_result=%d packets=%llu video=%llu audio=%llu",
+				 read_result, static_cast<unsigned long long>(packets),
+				 static_cast<unsigned long long>(video_frames_),
+				 static_cast<unsigned long long>(audio_frames_));
 			return stopping.load() || read_result == AVERROR_EOF;
+		}
+
+		// obs_source_frame carries the YUV->RGB matrix the renderer uses, and a
+		// zeroed matrix renders black. Recomputed only when the stream changes.
+		void update_color_parameters(const AVFrame *decoded, obs_source_frame &frame)
+		{
+			const video_range_type range = decoded->color_range == AVCOL_RANGE_JPEG
+											   ? VIDEO_RANGE_FULL
+											   : VIDEO_RANGE_PARTIAL;
+			video_colorspace colorspace = VIDEO_CS_DEFAULT;
+			switch (decoded->colorspace)
+			{
+			case AVCOL_SPC_BT709:
+				colorspace = VIDEO_CS_709;
+				break;
+			case AVCOL_SPC_BT470BG:
+			case AVCOL_SPC_SMPTE170M:
+				colorspace = VIDEO_CS_601;
+				break;
+			default:
+				colorspace = decoded->height >= 720 ? VIDEO_CS_709 : VIDEO_CS_601;
+				break;
+			}
+
+			if (!color_parameters_set_ || colorspace != color_space_ ||
+				range != color_range_ || frame.format != color_format_)
+			{
+				if (!video_format_get_parameters_for_format(
+						colorspace, range, frame.format, color_matrix_,
+						color_range_min_, color_range_max_))
+				{
+					blog(LOG_WARNING,
+						 "[obs-srtla-source] unsupported color parameters: cs=%d range=%d",
+						 static_cast<int>(colorspace), static_cast<int>(range));
+					return;
+				}
+				color_parameters_set_ = true;
+				color_space_ = colorspace;
+				color_range_ = range;
+				color_format_ = frame.format;
+				blog(LOG_INFO,
+					 "[obs-srtla-source] color parameters: cs=%d range=%s format=%d",
+					 static_cast<int>(colorspace),
+					 range == VIDEO_RANGE_FULL ? "full" : "partial",
+					 static_cast<int>(frame.format));
+			}
+
+			std::memcpy(frame.color_matrix, color_matrix_, sizeof(frame.color_matrix));
+			std::memcpy(frame.color_range_min, color_range_min_,
+						sizeof(frame.color_range_min));
+			std::memcpy(frame.color_range_max, color_range_max_,
+						sizeof(frame.color_range_max));
+			frame.full_range = range == VIDEO_RANGE_FULL;
 		}
 
 		void output_video(AVFrame *decoded, uint64_t timestamp)
 		{
-			scaler_ = sws_getCachedContext(scaler_, decoded->width, decoded->height,
-										   static_cast<AVPixelFormat>(decoded->format),
-										   decoded->width, decoded->height, AV_PIX_FMT_NV12,
-										   SWS_BILINEAR, nullptr, nullptr, nullptr);
-			if (!scaler_)
-				return;
+			const AVPixelFormat source_format = static_cast<AVPixelFormat>(decoded->format);
+			// Planar 4:2:0 is what OBS wants, so the common case skips swscale.
+			const bool passthrough = source_format == AV_PIX_FMT_YUV420P ||
+									 source_format == AV_PIX_FMT_YUVJ420P;
 
-			AVFrame *converted = av_frame_alloc();
-			if (!converted)
-				return;
-			converted->format = AV_PIX_FMT_NV12;
-			converted->width = decoded->width;
-			converted->height = decoded->height;
-			if (av_frame_get_buffer(converted, 32) < 0)
+			AVFrame *converted = nullptr;
+			if (!passthrough)
 			{
-				av_frame_free(&converted);
-				return;
-			}
-			if (sws_scale(scaler_, decoded->data, decoded->linesize, 0, decoded->height,
-						  converted->data, converted->linesize) <= 0)
-			{
-				av_frame_free(&converted);
-				return;
+				scaler_ = sws_getCachedContext(scaler_, decoded->width, decoded->height,
+											   source_format, decoded->width,
+											   decoded->height, AV_PIX_FMT_YUV420P,
+											   SWS_BILINEAR, nullptr, nullptr, nullptr);
+				if (!scaler_)
+					return;
+
+				converted = av_frame_alloc();
+				if (!converted)
+					return;
+				converted->format = AV_PIX_FMT_YUV420P;
+				converted->width = decoded->width;
+				converted->height = decoded->height;
+				if (av_frame_get_buffer(converted, 32) < 0)
+				{
+					av_frame_free(&converted);
+					return;
+				}
+				if (sws_scale(scaler_, decoded->data, decoded->linesize, 0,
+							  decoded->height, converted->data, converted->linesize) <= 0)
+				{
+					blog(LOG_WARNING, "[obs-srtla-source] sws_scale produced no output");
+					av_frame_free(&converted);
+					return;
+				}
 			}
 
+			const AVFrame *source = converted ? converted : decoded;
 			obs_source_frame frame{};
-			frame.format = VIDEO_FORMAT_NV12;
-			frame.width = static_cast<uint32_t>(converted->width);
-			frame.height = static_cast<uint32_t>(converted->height);
+			frame.format = VIDEO_FORMAT_I420;
+			frame.width = static_cast<uint32_t>(source->width);
+			frame.height = static_cast<uint32_t>(source->height);
 			frame.timestamp = timestamp;
-			frame.data[0] = converted->data[0];
-			frame.data[1] = converted->data[1];
-			frame.linesize[0] = static_cast<uint32_t>(converted->linesize[0]);
-			frame.linesize[1] = static_cast<uint32_t>(converted->linesize[1]);
+			for (int plane = 0; plane < 3; ++plane)
+			{
+				frame.data[plane] = source->data[plane];
+				frame.linesize[plane] = static_cast<uint32_t>(source->linesize[plane]);
+			}
+			update_color_parameters(decoded, frame);
 			obs_source_output_video(source_, &frame);
-			av_frame_free(&converted);
+			if (++video_frames_ % 30 == 1)
+				blog(LOG_INFO,
+					 "[obs-srtla-source] video frames output: %llu (%ux%u src_fmt=%d %s ts=%llu)",
+					 static_cast<unsigned long long>(video_frames_), frame.width,
+					 frame.height, decoded->format,
+					 passthrough ? "passthrough" : "scaled",
+					 static_cast<unsigned long long>(timestamp));
+			if (converted)
+				av_frame_free(&converted);
 		}
 
 		bool ensure_resampler(const AVFrame *frame)
@@ -464,6 +583,11 @@ namespace
 				for (int i = 0; i < channels; ++i)
 					audio.data[i] = planes[i];
 				obs_source_output_audio(source_, &audio);
+				if (++audio_frames_ % 100 == 1)
+					blog(LOG_INFO,
+						 "[obs-srtla-source] audio frames decoded: %llu (ch=%d sr=%d)",
+						 static_cast<unsigned long long>(audio_frames_), channels,
+						 decoded->sample_rate);
 			}
 			av_freep(&planes[0]);
 		}
@@ -480,6 +604,19 @@ namespace
 		bool timestamp_origin_set_ = false;
 		int64_t media_origin_ns_ = 0;
 		uint64_t capture_origin_ns_ = 0;
+		uint64_t video_frames_ = 0;
+		uint64_t audio_frames_ = 0;
+		float color_matrix_[16] = {};
+		float color_range_min_[3] = {};
+		float color_range_max_[3] = {};
+		video_colorspace color_space_ = VIDEO_CS_DEFAULT;
+		video_range_type color_range_ = VIDEO_RANGE_DEFAULT;
+		video_format color_format_ = VIDEO_FORMAT_NONE;
+		bool color_parameters_set_ = false;
+		bool video_send_logged_ = false;
+		bool audio_send_logged_ = false;
+		bool video_receive_logged_ = false;
+		bool audio_receive_logged_ = false;
 	};
 
 	class SrtlaInput
