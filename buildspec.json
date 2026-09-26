@@ -1,0 +1,20 @@
+{
+  "dependencies": {
+    "obs-studio": {
+      "version": "31.1.1",
+      "baseUrl": "https://github.com/obsproject/obs-studio/archive/refs/tags",
+      "label": "OBS sources"
+    }
+  },
+  "name": "obs-srtla-source",
+  "displayName": "OBS SRTLA Source",
+  "version": "1.0.0",
+  "author": "OBS SRTLA Source contributors",
+  "website": "",
+  "email": "",
+  "platformConfig": {
+    "macos": {
+      "bundleId": "com.obsproject.obs-srtla-source"
+    }
+  }
+}

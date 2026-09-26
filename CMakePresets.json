@@ -1,0 +1,34 @@
+{
+  "version": 8,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 28,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "ubuntu-x86_64",
+      "displayName": "Ubuntu x86_64",
+      "description": "Build the plugin on Linux using the OBS plugin template setup",
+      "binaryDir": "${sourceDir}/build_x86_64",
+      "generator": "Ninja",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_INSTALL_LIBDIR": "lib/CMAKE_SYSTEM_PROCESSOR-linux-gnu"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "ubuntu-x86_64",
+      "configurePreset": "ubuntu-x86_64",
+      "displayName": "Ubuntu x86_64",
+      "configuration": "RelWithDebInfo"
+    }
+  ]
+}
