@@ -1,3 +1,4 @@
+#include "plugin-log.hpp"
 #include "srtla-receiver.hpp"
 
 #include <arpa/inet.h>
@@ -5,14 +6,10 @@
 #include <obs-module.h>
 #include <util/platform.h>
 
-extern "C"
-{
+extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
-#include <libavutil/channel_layout.h>
-#include <libavutil/imgutils.h>
-#include <libavutil/mathematics.h>
-#include <libavutil/samplefmt.h>
+#include <libavutil/pixdesc.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 }
@@ -24,7 +21,6 @@ extern "C"
 #undef LOG_DEBUG
 
 #include <atomic>
-#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -32,813 +28,672 @@ extern "C"
 #include <string>
 #include <system_error>
 #include <thread>
-#include <vector>
 
-namespace
+OBS_DECLARE_MODULE()
+OBS_MODULE_USE_DEFAULT_LOCALE("obs-srtla-source", "en-US")
+
+namespace {
+
+constexpr char setting_port[] = "srtla_port";
+constexpr uint16_t default_port = 5000;
+constexpr int avio_buffer_size = 32 * 1024;
+// Upper bound for how long blocking SRT calls take to notice a stop request.
+constexpr int srt_timeout_ms = 250;
+
+void srt_log_to_obs(void *, int level, const char *, int, const char *, const char *message)
 {
+	// The plugin reports actionable SRT failures itself; libsrt's own error
+	// lines (e.g. accept on a listener closed during shutdown) stay at debug.
+	const int obs_level = level <= LOG_CRIT ? LOG_WARNING : LOG_DEBUG;
+	std::string text = message ? message : "";
+	while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
+		text.pop_back();
+	const size_t start = text.find_first_not_of(": ");
+	plugin_log(obs_level, "libsrt: %s", start == std::string::npos ? "" : text.c_str() + start);
+}
 
-	constexpr char setting_port[] = "srtla_port";
-	constexpr int avio_buffer_size = 32 * 1024;
+// libsrt is started on first use and cleaned up only at module unload:
+// srt_cleanup() blocks for about a second, too long for a source update.
+std::once_flag srt_started_once;
+bool srt_started = false;
 
-	static void srt_log_to_obs(void *, int level, const char *, int, const char *,
-							   const char *message)
+bool start_srt()
+{
+	std::call_once(srt_started_once, [] {
+		srt_started = srt_startup() != SRT_ERROR;
+		if (!srt_started)
+			plugin_log(LOG_ERROR, "libsrt startup failed: %s", srt_getlasterror_str());
+	});
+	return srt_started;
+}
+
+void close_socket(std::atomic<SRTSOCKET> &socket)
+{
+	const SRTSOCKET value = socket.exchange(SRT_INVALID_SOCK);
+	if (value != SRT_INVALID_SOCK)
+		srt_close(value);
+}
+
+void log_av_error(const char *message, int error)
+{
+	char text[AV_ERROR_MAX_STRING_SIZE] = {};
+	av_strerror(error, text, sizeof(text));
+	plugin_log(LOG_WARNING, "%s: %s", message, text);
+}
+
+struct AvDeleter {
+	void operator()(AVCodecContext *context) const { avcodec_free_context(&context); }
+	void operator()(AVFormatContext *format) const { avformat_close_input(&format); }
+	void operator()(AVFrame *frame) const { av_frame_free(&frame); }
+	void operator()(AVPacket *packet) const { av_packet_free(&packet); }
+	void operator()(SwsContext *scaler) const { sws_freeContext(scaler); }
+	void operator()(SwrContext *resampler) const { swr_free(&resampler); }
+	void operator()(AVIOContext *io) const
 	{
-		// The plugin reports actionable SRT failures itself; libsrt's own error
-		// lines (e.g. accept on a listener closed during shutdown) stay at debug.
-		const int obs_level = level <= LOG_CRIT ? LOG_WARNING : LOG_DEBUG;
-		std::string text = message ? message : "";
-		while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
-			text.pop_back();
-		const size_t start = text.find_first_not_of(": ");
-		blog(obs_level, "[obs-srtla-source] libsrt: %s",
-			 start == std::string::npos ? "" : text.c_str() + start);
+		av_freep(&io->buffer);
+		avio_context_free(&io);
+	}
+};
+
+template<typename T> using AvPtr = std::unique_ptr<T, AvDeleter>;
+
+// Formats OBS renders natively; anything else is converted to I420.
+video_format obs_video_format(int format)
+{
+	switch (format) {
+	case AV_PIX_FMT_YUV420P:
+	case AV_PIX_FMT_YUVJ420P:
+		return VIDEO_FORMAT_I420;
+	case AV_PIX_FMT_NV12:
+		return VIDEO_FORMAT_NV12;
+	case AV_PIX_FMT_YUV422P:
+	case AV_PIX_FMT_YUVJ422P:
+		return VIDEO_FORMAT_I422;
+	case AV_PIX_FMT_YUV444P:
+	case AV_PIX_FMT_YUVJ444P:
+		return VIDEO_FORMAT_I444;
+	case AV_PIX_FMT_YUYV422:
+		return VIDEO_FORMAT_YUY2;
+	case AV_PIX_FMT_UYVY422:
+		return VIDEO_FORMAT_UYVY;
+	case AV_PIX_FMT_YVYU422:
+		return VIDEO_FORMAT_YVYU;
+	case AV_PIX_FMT_YUV420P10LE:
+		return VIDEO_FORMAT_I010;
+	case AV_PIX_FMT_P010LE:
+		return VIDEO_FORMAT_P010;
+	case AV_PIX_FMT_YUV422P10LE:
+		return VIDEO_FORMAT_I210;
+	case AV_PIX_FMT_YUV444P12LE:
+		return VIDEO_FORMAT_I412;
+	case AV_PIX_FMT_YUVA420P:
+		return VIDEO_FORMAT_I40A;
+	case AV_PIX_FMT_YUVA422P:
+		return VIDEO_FORMAT_I42A;
+	case AV_PIX_FMT_YUVA444P:
+		return VIDEO_FORMAT_YUVA;
+	default:
+		return VIDEO_FORMAT_NONE;
+	}
+}
+
+video_colorspace obs_colorspace(const AVFrame *frame)
+{
+	if (frame->color_trc == AVCOL_TRC_SMPTE2084)
+		return VIDEO_CS_2100_PQ;
+	if (frame->color_trc == AVCOL_TRC_ARIB_STD_B67)
+		return VIDEO_CS_2100_HLG;
+	switch (frame->colorspace) {
+	case AVCOL_SPC_BT709:
+		return frame->color_trc == AVCOL_TRC_IEC61966_2_1 ? VIDEO_CS_SRGB : VIDEO_CS_709;
+	case AVCOL_SPC_FCC:
+	case AVCOL_SPC_BT470BG:
+	case AVCOL_SPC_SMPTE170M:
+	case AVCOL_SPC_SMPTE240M:
+		return VIDEO_CS_601;
+	default:
+		// Untagged streams: HD content is almost always BT.709.
+		return frame->height >= 720 ? VIDEO_CS_709 : VIDEO_CS_601;
+	}
+}
+
+video_trc obs_trc(AVColorTransferCharacteristic trc)
+{
+	switch (trc) {
+	case AVCOL_TRC_SMPTE2084:
+		return VIDEO_TRC_PQ;
+	case AVCOL_TRC_ARIB_STD_B67:
+		return VIDEO_TRC_HLG;
+	default:
+		return VIDEO_TRC_DEFAULT;
+	}
+}
+
+audio_format obs_audio_format(int format)
+{
+	switch (format) {
+	case AV_SAMPLE_FMT_U8:
+		return AUDIO_FORMAT_U8BIT;
+	case AV_SAMPLE_FMT_S16:
+		return AUDIO_FORMAT_16BIT;
+	case AV_SAMPLE_FMT_S32:
+		return AUDIO_FORMAT_32BIT;
+	case AV_SAMPLE_FMT_FLT:
+		return AUDIO_FORMAT_FLOAT;
+	case AV_SAMPLE_FMT_U8P:
+		return AUDIO_FORMAT_U8BIT_PLANAR;
+	case AV_SAMPLE_FMT_S16P:
+		return AUDIO_FORMAT_16BIT_PLANAR;
+	case AV_SAMPLE_FMT_S32P:
+		return AUDIO_FORMAT_32BIT_PLANAR;
+	case AV_SAMPLE_FMT_FLTP:
+		return AUDIO_FORMAT_FLOAT_PLANAR;
+	default:
+		return AUDIO_FORMAT_UNKNOWN;
+	}
+}
+
+// OBS speaker layouts have fixed channel orders, so multichannel audio is
+// passed through only when its FFmpeg layout has exactly that order.
+speaker_layout obs_speakers(const AVChannelLayout &layout)
+{
+	if (layout.nb_channels == 1)
+		return SPEAKERS_MONO;
+	if (layout.nb_channels == 2)
+		return SPEAKERS_STEREO;
+	static const struct {
+		AVChannelLayout layout;
+		speaker_layout speakers;
+	} layouts[] = {
+		{AV_CHANNEL_LAYOUT_2POINT1, SPEAKERS_2POINT1},  {AV_CHANNEL_LAYOUT_4POINT0, SPEAKERS_4POINT0},
+		{AV_CHANNEL_LAYOUT_4POINT1, SPEAKERS_4POINT1},  {AV_CHANNEL_LAYOUT_5POINT1, SPEAKERS_5POINT1},
+		{AV_CHANNEL_LAYOUT_5POINT1_BACK, SPEAKERS_5POINT1}, {AV_CHANNEL_LAYOUT_7POINT1, SPEAKERS_7POINT1},
+	};
+	for (const auto &entry : layouts)
+		if (av_channel_layout_compare(&layout, &entry.layout) == 0)
+			return entry.speakers;
+	return SPEAKERS_UNKNOWN;
+}
+
+struct SrtReader {
+	SRTSOCKET socket;
+	const std::atomic<bool> &stopping;
+};
+
+int read_srt(void *opaque, uint8_t *buffer, int size)
+{
+	auto *reader = static_cast<SrtReader *>(opaque);
+	while (!reader->stopping) {
+		const int received = srt_recvmsg(reader->socket, reinterpret_cast<char *>(buffer), size);
+		if (received > 0)
+			return received;
+		const int error = srt_getlasterror(nullptr);
+		if (error != SRT_ETIMEOUT && error != SRT_EASYNCRCV)
+			break;
+	}
+	return AVERROR_EOF;
+}
+
+// Demuxes and decodes one SRT connection's MPEG-TS stream into OBS frames.
+// Decoded frames are handed to OBS without conversion whenever OBS supports
+// their pixel/sample format; OBS copies them before output_* returns.
+class MediaDecoder {
+public:
+	explicit MediaDecoder(obs_source_t *source) : source_(source) {}
+
+	void run(SRTSOCKET socket, const std::atomic<bool> &stopping)
+	{
+		SrtReader reader{socket, stopping};
+		auto *buffer = static_cast<uint8_t *>(av_malloc(avio_buffer_size));
+		AvPtr<AVIOContext> io(buffer ? avio_alloc_context(buffer, avio_buffer_size, 0, &reader, read_srt,
+								  nullptr, nullptr)
+					     : nullptr);
+		if (!io) {
+			av_free(buffer);
+			return;
+		}
+
+		AVFormatContext *raw_format = avformat_alloc_context();
+		if (!raw_format)
+			return;
+		raw_format->pb = io.get();
+		// On failure avformat_open_input frees the context itself.
+		int result = avformat_open_input(&raw_format, nullptr, av_find_input_format("mpegts"), nullptr);
+		if (result < 0) {
+			if (!stopping)
+				log_av_error("could not open MPEG-TS input", result);
+			return;
+		}
+		AvPtr<AVFormatContext> format(raw_format);
+
+		result = avformat_find_stream_info(format.get(), nullptr);
+		if (result < 0) {
+			if (!stopping)
+				log_av_error("could not read MPEG-TS stream information", result);
+			return;
+		}
+		decode(format.get(), stopping);
 	}
 
-	class SrtRuntime
+private:
+	int open_decoder(AVFormatContext *format, AVMediaType type, AvPtr<AVCodecContext> &decoder)
 	{
-	public:
-		SrtRuntime()
-		{
-			std::lock_guard<std::mutex> lock(runtime_mutex());
-			if (runtime_references() == 0)
-			{
-				srt_setloghandler(nullptr, srt_log_to_obs);
-				srt_setlogflags(SRT_LOGF_DISABLE_TIME | SRT_LOGF_DISABLE_THREADNAME |
-								SRT_LOGF_DISABLE_SEVERITY | SRT_LOGF_DISABLE_EOL);
-				srt_setloglevel(LOG_ERR);
-				if (srt_startup() == SRT_ERROR)
-					return;
-			}
-			ready_ = true;
-			++runtime_references();
+		const AVCodec *codec = nullptr;
+		const int index = av_find_best_stream(format, type, -1, -1, &codec, 0);
+		const char *type_name = av_get_media_type_string(type);
+		if (index == AVERROR_DECODER_NOT_FOUND)
+			plugin_log(LOG_WARNING, "no decoder for the %s stream", type_name);
+		if (index < 0)
+			return -1;
+
+		const AVCodecParameters *parameters = format->streams[index]->codecpar;
+		AvPtr<AVCodecContext> context(avcodec_alloc_context3(codec));
+		if (!context || avcodec_parameters_to_context(context.get(), parameters) < 0)
+			return -1;
+		const int result = avcodec_open2(context.get(), codec, nullptr);
+		if (result < 0) {
+			log_av_error("could not open decoder", result);
+			return -1;
 		}
+		if (type == AVMEDIA_TYPE_VIDEO)
+			plugin_log(LOG_INFO, "video stream: %s %dx%d", codec->name, parameters->width,
+				   parameters->height);
+		else
+			plugin_log(LOG_INFO, "audio stream: %s %d Hz, %d channels", codec->name,
+				   parameters->sample_rate, parameters->ch_layout.nb_channels);
+		decoder = std::move(context);
+		return index;
+	}
 
-		~SrtRuntime()
-		{
-			if (!ready_)
-				return;
-			std::lock_guard<std::mutex> lock(runtime_mutex());
-			if (--runtime_references() == 0)
-				srt_cleanup();
-		}
-
-		bool ready() const { return ready_; }
-
-	private:
-		static std::mutex &runtime_mutex()
-		{
-			static std::mutex mutex;
-			return mutex;
-		}
-
-		static unsigned &runtime_references()
-		{
-			static unsigned references = 0;
-			return references;
-		}
-
-		bool ready_ = false;
-	};
-
-	static void close_socket(SRTSOCKET &socket)
+	void decode(AVFormatContext *format, const std::atomic<bool> &stopping)
 	{
-		if (socket != SRT_INVALID_SOCK)
-		{
-			srt_close(socket);
-			socket = SRT_INVALID_SOCK;
+		const int video_index = open_decoder(format, AVMEDIA_TYPE_VIDEO, video_);
+		const int audio_index = open_decoder(format, AVMEDIA_TYPE_AUDIO, audio_);
+		if (!video_ && !audio_) {
+			plugin_log(LOG_WARNING, "stream has no supported audio or video");
+			return;
+		}
+
+		AvPtr<AVPacket> packet(av_packet_alloc());
+		AvPtr<AVFrame> frame(av_frame_alloc());
+		if (!packet || !frame)
+			return;
+
+		int result = 0;
+		while (!stopping && (result = av_read_frame(format, packet.get())) >= 0) {
+			const int index = packet->stream_index;
+			AVCodecContext *decoder = index == video_index   ? video_.get()
+						  : index == audio_index ? audio_.get()
+									 : nullptr;
+			if (decoder)
+				decode_packet(decoder, packet.get(), frame.get(), format->streams[index]->time_base);
+			av_packet_unref(packet.get());
+		}
+		if (!stopping && result < 0 && result != AVERROR_EOF)
+			log_av_error("MPEG-TS read failed", result);
+	}
+
+	void decode_packet(AVCodecContext *decoder, const AVPacket *packet, AVFrame *frame, AVRational time_base)
+	{
+		int result = avcodec_send_packet(decoder, packet);
+		while (result >= 0) {
+			result = avcodec_receive_frame(decoder, frame);
+			if (result < 0)
+				break;
+			const uint64_t timestamp = obs_timestamp(frame->best_effort_timestamp, time_base);
+			if (decoder == video_.get())
+				output_video(frame, timestamp);
+			else
+				output_audio(frame, timestamp);
+			av_frame_unref(frame);
+		}
+		// Lossy links produce corrupt packets; one report per stream is enough.
+		if (result != AVERROR(EAGAIN) && result != AVERROR_EOF && !decode_error_logged_) {
+			decode_error_logged_ = true;
+			log_av_error("decoding failed", result);
 		}
 	}
 
-	static void close_socket(std::atomic<SRTSOCKET> &socket)
-	{
-		const SRTSOCKET value = socket.exchange(SRT_INVALID_SOCK);
-		if (value != SRT_INVALID_SOCK)
-			srt_close(value);
-	}
-
-	struct AvioReader
-	{
-		SRTSOCKET socket = SRT_INVALID_SOCK;
-		const std::atomic<bool> *stopping = nullptr;
-	};
-
-	static int read_srt(void *opaque, uint8_t *buffer, int buffer_size)
-	{
-		auto *reader = static_cast<AvioReader *>(opaque);
-		while (!reader->stopping->load())
-		{
-			const int received = srt_recvmsg(reader->socket, reinterpret_cast<char *>(buffer),
-											 buffer_size);
-			if (received > 0)
-				return received;
-			if (reader->stopping->load())
-				return AVERROR_EOF;
-			const int error = srt_getlasterror(nullptr);
-			if (error == SRT_EASYNCRCV || error == SRT_ETIMEOUT)
-				continue;
-			return AVERROR_EOF;
-		}
-		return AVERROR_EOF;
-	}
-
-	struct PacketDeleter
-	{
-		void operator()(AVPacket *packet) const { av_packet_free(&packet); }
-	};
-
-	struct FrameDeleter
-	{
-		void operator()(AVFrame *frame) const { av_frame_free(&frame); }
-	};
-
-	static uint64_t timestamp_ns(int64_t pts, AVRational time_base,
-								 bool &origin_set, int64_t &media_origin_ns,
-								 uint64_t &capture_origin_ns)
+	// Maps media time onto the OBS clock. Audio and video share one origin so
+	// OBS keeps them in sync; OBS itself handles timestamp jumps.
+	uint64_t obs_timestamp(int64_t pts, AVRational time_base)
 	{
 		if (pts == AV_NOPTS_VALUE)
 			return os_gettime_ns();
-		const int64_t media_time_ns = av_rescale_q(pts, time_base,
-												   AVRational{1, 1000000000});
-		if (!origin_set)
-		{
-			origin_set = true;
-			media_origin_ns = media_time_ns;
-			capture_origin_ns = os_gettime_ns();
+		const int64_t media_ns = av_rescale_q(pts, time_base, AVRational{1, 1000000000});
+		if (!origin_set_) {
+			origin_set_ = true;
+			media_origin_ns_ = media_ns;
+			clock_origin_ns_ = static_cast<int64_t>(os_gettime_ns());
 		}
-		const int64_t elapsed_ns = media_time_ns - media_origin_ns;
-		return elapsed_ns < 0 ? capture_origin_ns
-							  : capture_origin_ns + static_cast<uint64_t>(elapsed_ns);
+		const int64_t timestamp = clock_origin_ns_ + (media_ns - media_origin_ns_);
+		return timestamp > 0 ? static_cast<uint64_t>(timestamp) : 0;
 	}
 
-	class MediaDecoder
+	const AVFrame *convert_to_i420(const AVFrame *decoded)
 	{
-	public:
-		explicit MediaDecoder(obs_source_t *source) : source_(source) {}
-
-		~MediaDecoder()
-		{
-			if (video_codec_)
-				avcodec_free_context(&video_codec_);
-			if (audio_codec_)
-				avcodec_free_context(&audio_codec_);
-			if (scaler_)
-				sws_freeContext(scaler_);
-			if (resampler_)
-				swr_free(&resampler_);
-			av_channel_layout_uninit(&input_layout_);
-			av_channel_layout_uninit(&output_layout_);
-		}
-
-		bool run(SRTSOCKET socket, const std::atomic<bool> &stopping)
-		{
-			AvioReader reader{socket, &stopping};
-			uint8_t *buffer = static_cast<uint8_t *>(av_malloc(avio_buffer_size));
-			if (!buffer)
-				return false;
-			AVIOContext *io = avio_alloc_context(buffer, avio_buffer_size, 0, &reader,
-												 read_srt, nullptr, nullptr);
-			if (!io)
-			{
-				av_free(buffer);
-				return false;
-			}
-
-			AVFormatContext *format = avformat_alloc_context();
-			if (!format)
-			{
-				av_freep(&io->buffer);
-				avio_context_free(&io);
-				return false;
-			}
-			format->pb = io;
-			format->flags |= AVFMT_FLAG_CUSTOM_IO;
-
-			int result = avformat_open_input(&format, nullptr, nullptr, nullptr);
-			if (result < 0)
-			{
-				log_av_error("could not open MPEG-TS input", result);
-				if (format)
-					avformat_free_context(format);
-				format = nullptr;
-			}
-			else
-			{
-				blog(LOG_INFO,
-					 "[obs-srtla-source] MPEG-TS opened: iformat=%s nb_streams=%u",
-					 format->iformat ? format->iformat->name : "?", format->nb_streams);
-				result = avformat_find_stream_info(format, nullptr);
-				if (result < 0)
-				{
-					log_av_error("could not read MPEG-TS stream information", result);
-				}
-				else
-				{
-					for (unsigned int i = 0; i < format->nb_streams; ++i)
-					{
-						const AVCodecParameters *p = format->streams[i]->codecpar;
-						blog(LOG_INFO,
-							 "[obs-srtla-source]   stream %u: type=%d codec=%s w=%d h=%d sr=%d",
-							 i, static_cast<int>(p->codec_type),
-							 avcodec_get_name(p->codec_id), p->width, p->height,
-							 p->sample_rate);
-					}
-					result = decode(format, stopping);
-				}
-				avformat_close_input(&format);
-			}
-
-			av_freep(&io->buffer);
-			avio_context_free(&io);
-			return result >= 0 || stopping.load();
-		}
-
-	private:
-		static void log_av_error(const char *message, int error)
-		{
-			char error_text[AV_ERROR_MAX_STRING_SIZE] = {};
-			av_strerror(error, error_text, sizeof(error_text));
-			blog(LOG_WARNING, "[obs-srtla-source] %s: %s", message, error_text);
-		}
-
-		// Codec errors can repeat once per packet; only the first is reported.
-		static void log_av_error_once(bool &logged, const char *message, int error)
-		{
-			if (logged)
-				return;
-			logged = true;
-			log_av_error(message, error);
-		}
-
-		AVCodecContext *create_decoder(AVFormatContext *format, int stream_index)
-		{
-			if (stream_index < 0)
+		scaler_.reset(sws_getCachedContext(scaler_.release(), decoded->width, decoded->height,
+						   static_cast<AVPixelFormat>(decoded->format), decoded->width,
+						   decoded->height, AV_PIX_FMT_YUV420P, SWS_BILINEAR, nullptr, nullptr,
+						   nullptr));
+		if (!scaler_)
+			return nullptr;
+		if (!converted_ || converted_->width != decoded->width || converted_->height != decoded->height) {
+			converted_.reset(av_frame_alloc());
+			if (!converted_)
 				return nullptr;
-			AVStream *stream = format->streams[stream_index];
-			const AVCodec *codec = avcodec_find_decoder(stream->codecpar->codec_id);
-			if (!codec)
-			{
-				blog(LOG_WARNING, "[obs-srtla-source] no decoder for stream %d",
-					 stream_index);
+			converted_->format = AV_PIX_FMT_YUV420P;
+			converted_->width = decoded->width;
+			converted_->height = decoded->height;
+			if (av_frame_get_buffer(converted_.get(), 0) < 0) {
+				converted_.reset();
 				return nullptr;
 			}
-			AVCodecContext *context = avcodec_alloc_context3(codec);
-			if (!context)
-				return nullptr;
-			if (avcodec_parameters_to_context(context, stream->codecpar) < 0 ||
-				avcodec_open2(context, codec, nullptr) < 0)
-			{
-				avcodec_free_context(&context);
-				return nullptr;
-			}
-			return context;
 		}
-
-		bool decode(AVFormatContext *format, const std::atomic<bool> &stopping)
-		{
-			int video_index = -1;
-			int audio_index = -1;
-			for (unsigned int i = 0; i < format->nb_streams; ++i)
-			{
-				if (format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
-					video_index < 0)
-					video_index = static_cast<int>(i);
-				else if (format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
-						 audio_index < 0)
-					audio_index = static_cast<int>(i);
-			}
-			video_codec_ = create_decoder(format, video_index);
-			audio_codec_ = create_decoder(format, audio_index);
-			blog(LOG_INFO, "[obs-srtla-source] decoder: video=%s audio=%s",
-				 video_codec_ ? "ok" : "none", audio_codec_ ? "ok" : "none");
-			if (!video_codec_ && !audio_codec_)
-			{
-				blog(LOG_WARNING, "[obs-srtla-source] stream has no supported audio or video");
-				return false;
-			}
-
-			std::unique_ptr<AVPacket, PacketDeleter> packet(av_packet_alloc());
-			std::unique_ptr<AVFrame, FrameDeleter> frame(av_frame_alloc());
-			if (!packet || !frame)
-				return false;
-
-			int read_result = 0;
-			uint64_t packets = 0;
-			while (!stopping.load() && (read_result = av_read_frame(format, packet.get())) >= 0)
-			{
-				if (++packets % 300 == 1)
-					blog(LOG_INFO,
-						 "[obs-srtla-source] packets demuxed: %llu (last stream_index=%d size=%d)",
-						 static_cast<unsigned long long>(packets), packet->stream_index,
-						 packet->size);
-				AVCodecContext *codec = packet->stream_index == video_index
-											? video_codec_
-										: packet->stream_index == audio_index ? audio_codec_
-																			  : nullptr;
-				int send_result = codec ? avcodec_send_packet(codec, packet.get())
-										: AVERROR(EINVAL);
-				if (codec && send_result < 0)
-					log_av_error_once(codec == video_codec_ ? video_send_logged_
-															: audio_send_logged_,
-									  "avcodec_send_packet failed", send_result);
-				if (codec && send_result >= 0)
-				{
-					int receive_result = 0;
-					while ((receive_result = avcodec_receive_frame(codec, frame.get())) >= 0)
-					{
-						const AVStream *stream = format->streams[packet->stream_index];
-						if (codec == video_codec_)
-							output_video(frame.get(), timestamp_ns(
-														  frame->best_effort_timestamp,
-														  stream->time_base, timestamp_origin_set_,
-														  media_origin_ns_, capture_origin_ns_));
-						else
-							output_audio(frame.get(), timestamp_ns(
-														  frame->best_effort_timestamp,
-														  stream->time_base, timestamp_origin_set_,
-														  media_origin_ns_, capture_origin_ns_));
-						av_frame_unref(frame.get());
-					}
-					if (receive_result != AVERROR(EAGAIN) && receive_result != AVERROR_EOF)
-						log_av_error_once(codec == video_codec_ ? video_receive_logged_
-																: audio_receive_logged_,
-										  "avcodec_receive_frame failed", receive_result);
-				}
-				av_packet_unref(packet.get());
-			}
-			if (read_result < 0 && !stopping.load() && read_result != AVERROR_EOF)
-				log_av_error("MPEG-TS read failed", read_result);
-			blog(LOG_INFO,
-				 "[obs-srtla-source] decode loop ended: read_result=%d packets=%llu video=%llu audio=%llu",
-				 read_result, static_cast<unsigned long long>(packets),
-				 static_cast<unsigned long long>(video_frames_),
-				 static_cast<unsigned long long>(audio_frames_));
-			return stopping.load() || read_result == AVERROR_EOF;
-		}
-
-		// obs_source_frame carries the YUV->RGB matrix the renderer uses, and a
-		// zeroed matrix renders black. Recomputed only when the stream changes.
-		void update_color_parameters(const AVFrame *decoded, obs_source_frame &frame)
-		{
-			const video_range_type range = decoded->color_range == AVCOL_RANGE_JPEG
-											   ? VIDEO_RANGE_FULL
-											   : VIDEO_RANGE_PARTIAL;
-			video_colorspace colorspace = VIDEO_CS_DEFAULT;
-			switch (decoded->colorspace)
-			{
-			case AVCOL_SPC_BT709:
-				colorspace = VIDEO_CS_709;
-				break;
-			case AVCOL_SPC_BT470BG:
-			case AVCOL_SPC_SMPTE170M:
-				colorspace = VIDEO_CS_601;
-				break;
-			default:
-				colorspace = decoded->height >= 720 ? VIDEO_CS_709 : VIDEO_CS_601;
-				break;
-			}
-
-			if (!color_parameters_set_ || colorspace != color_space_ ||
-				range != color_range_ || frame.format != color_format_)
-			{
-				if (!video_format_get_parameters_for_format(
-						colorspace, range, frame.format, color_matrix_,
-						color_range_min_, color_range_max_))
-				{
-					blog(LOG_WARNING,
-						 "[obs-srtla-source] unsupported color parameters: cs=%d range=%d",
-						 static_cast<int>(colorspace), static_cast<int>(range));
-					return;
-				}
-				color_parameters_set_ = true;
-				color_space_ = colorspace;
-				color_range_ = range;
-				color_format_ = frame.format;
-				blog(LOG_INFO,
-					 "[obs-srtla-source] color parameters: cs=%d range=%s format=%d",
-					 static_cast<int>(colorspace),
-					 range == VIDEO_RANGE_FULL ? "full" : "partial",
-					 static_cast<int>(frame.format));
-			}
-
-			std::memcpy(frame.color_matrix, color_matrix_, sizeof(frame.color_matrix));
-			std::memcpy(frame.color_range_min, color_range_min_,
-						sizeof(frame.color_range_min));
-			std::memcpy(frame.color_range_max, color_range_max_,
-						sizeof(frame.color_range_max));
-			frame.full_range = range == VIDEO_RANGE_FULL;
-		}
-
-		void output_video(AVFrame *decoded, uint64_t timestamp)
-		{
-			const AVPixelFormat source_format = static_cast<AVPixelFormat>(decoded->format);
-			// Planar 4:2:0 is what OBS wants, so the common case skips swscale.
-			const bool passthrough = source_format == AV_PIX_FMT_YUV420P ||
-									 source_format == AV_PIX_FMT_YUVJ420P;
-
-			AVFrame *converted = nullptr;
-			if (!passthrough)
-			{
-				scaler_ = sws_getCachedContext(scaler_, decoded->width, decoded->height,
-											   source_format, decoded->width,
-											   decoded->height, AV_PIX_FMT_YUV420P,
-											   SWS_BILINEAR, nullptr, nullptr, nullptr);
-				if (!scaler_)
-					return;
-
-				converted = av_frame_alloc();
-				if (!converted)
-					return;
-				converted->format = AV_PIX_FMT_YUV420P;
-				converted->width = decoded->width;
-				converted->height = decoded->height;
-				if (av_frame_get_buffer(converted, 32) < 0)
-				{
-					av_frame_free(&converted);
-					return;
-				}
-				if (sws_scale(scaler_, decoded->data, decoded->linesize, 0,
-							  decoded->height, converted->data, converted->linesize) <= 0)
-				{
-					blog(LOG_WARNING, "[obs-srtla-source] sws_scale produced no output");
-					av_frame_free(&converted);
-					return;
-				}
-			}
-
-			const AVFrame *source = converted ? converted : decoded;
-			obs_source_frame frame{};
-			frame.format = VIDEO_FORMAT_I420;
-			frame.width = static_cast<uint32_t>(source->width);
-			frame.height = static_cast<uint32_t>(source->height);
-			frame.timestamp = timestamp;
-			for (int plane = 0; plane < 3; ++plane)
-			{
-				frame.data[plane] = source->data[plane];
-				frame.linesize[plane] = static_cast<uint32_t>(source->linesize[plane]);
-			}
-			update_color_parameters(decoded, frame);
-			obs_source_output_video(source_, &frame);
-			if (++video_frames_ % 30 == 1)
-				blog(LOG_INFO,
-					 "[obs-srtla-source] video frames output: %llu (%ux%u src_fmt=%d %s ts=%llu)",
-					 static_cast<unsigned long long>(video_frames_), frame.width,
-					 frame.height, decoded->format,
-					 passthrough ? "passthrough" : "scaled",
-					 static_cast<unsigned long long>(timestamp));
-			if (converted)
-				av_frame_free(&converted);
-		}
-
-		bool ensure_resampler(const AVFrame *frame)
-		{
-			AVChannelLayout source_layout{};
-			if (frame->ch_layout.nb_channels > 0)
-			{
-				if (av_channel_layout_copy(&source_layout, &frame->ch_layout) < 0)
-					return false;
-			}
-			else
-			{
-				return false;
-			}
-			if (source_layout.nb_channels <= 0 || source_layout.nb_channels > MAX_AV_PLANES)
-			{
-				av_channel_layout_uninit(&source_layout);
-				return false;
-			}
-
-			const int output_channels = source_layout.nb_channels == 1 ? 1 : 2;
-			AVChannelLayout wanted_output{};
-			av_channel_layout_default(&wanted_output, output_channels);
-			const bool same_layout = resampler_ &&
-									 av_channel_layout_compare(&source_layout, &input_layout_) == 0 &&
-									 av_channel_layout_compare(&wanted_output, &output_layout_) == 0 &&
-									 input_format_ == static_cast<AVSampleFormat>(frame->format) &&
-									 input_sample_rate_ == frame->sample_rate;
-			if (same_layout)
-			{
-				av_channel_layout_uninit(&source_layout);
-				av_channel_layout_uninit(&wanted_output);
-				return true;
-			}
-
-			swr_free(&resampler_);
-			av_channel_layout_uninit(&input_layout_);
-			av_channel_layout_uninit(&output_layout_);
-			if (av_channel_layout_copy(&input_layout_, &source_layout) < 0 ||
-				av_channel_layout_copy(&output_layout_, &wanted_output) < 0)
-			{
-				av_channel_layout_uninit(&source_layout);
-				av_channel_layout_uninit(&wanted_output);
-				return false;
-			}
-			av_channel_layout_uninit(&source_layout);
-			av_channel_layout_uninit(&wanted_output);
-			input_format_ = static_cast<AVSampleFormat>(frame->format);
-			input_sample_rate_ = frame->sample_rate;
-			if (swr_alloc_set_opts2(&resampler_, &output_layout_, AV_SAMPLE_FMT_FLTP,
-									frame->sample_rate, &input_layout_, input_format_,
-									frame->sample_rate, 0, nullptr) < 0 ||
-				swr_init(resampler_) < 0)
-			{
-				swr_free(&resampler_);
-				return false;
-			}
-			return true;
-		}
-
-		void output_audio(AVFrame *decoded, uint64_t timestamp)
-		{
-			if (!ensure_resampler(decoded))
-				return;
-			const int channels = output_layout_.nb_channels;
-			const int capacity = swr_get_out_samples(resampler_, decoded->nb_samples);
-			if (capacity <= 0)
-				return;
-
-			uint8_t *planes[MAX_AV_PLANES] = {};
-			const uint8_t *input_planes[MAX_AV_PLANES] = {};
-			const int input_plane_count =
-				av_sample_fmt_is_planar(static_cast<AVSampleFormat>(decoded->format))
-					? input_layout_.nb_channels
-					: 1;
-			if (input_plane_count > MAX_AV_PLANES)
-				return;
-			for (int i = 0; i < input_plane_count; ++i)
-				input_planes[i] = decoded->extended_data[i];
-			int line_size = 0;
-			if (av_samples_alloc(planes, &line_size, channels, capacity,
-								 AV_SAMPLE_FMT_FLTP, 0) < 0)
-				return;
-			const int samples = swr_convert(resampler_, planes, capacity,
-											input_planes, decoded->nb_samples);
-			if (samples > 0)
-			{
-				obs_source_audio audio{};
-				audio.format = AUDIO_FORMAT_FLOAT_PLANAR;
-				audio.samples_per_sec = static_cast<uint32_t>(decoded->sample_rate);
-				audio.speakers = channels == 1 ? SPEAKERS_MONO : SPEAKERS_STEREO;
-				audio.frames = static_cast<uint32_t>(samples);
-				audio.timestamp = timestamp;
-				for (int i = 0; i < channels; ++i)
-					audio.data[i] = planes[i];
-				obs_source_output_audio(source_, &audio);
-				if (++audio_frames_ % 100 == 1)
-					blog(LOG_INFO,
-						 "[obs-srtla-source] audio frames decoded: %llu (ch=%d sr=%d)",
-						 static_cast<unsigned long long>(audio_frames_), channels,
-						 decoded->sample_rate);
-			}
-			av_freep(&planes[0]);
-		}
-
-		obs_source_t *source_;
-		AVCodecContext *video_codec_ = nullptr;
-		AVCodecContext *audio_codec_ = nullptr;
-		SwsContext *scaler_ = nullptr;
-		SwrContext *resampler_ = nullptr;
-		AVChannelLayout input_layout_{};
-		AVChannelLayout output_layout_{};
-		AVSampleFormat input_format_ = AV_SAMPLE_FMT_NONE;
-		int input_sample_rate_ = 0;
-		bool timestamp_origin_set_ = false;
-		int64_t media_origin_ns_ = 0;
-		uint64_t capture_origin_ns_ = 0;
-		uint64_t video_frames_ = 0;
-		uint64_t audio_frames_ = 0;
-		float color_matrix_[16] = {};
-		float color_range_min_[3] = {};
-		float color_range_max_[3] = {};
-		video_colorspace color_space_ = VIDEO_CS_DEFAULT;
-		video_range_type color_range_ = VIDEO_RANGE_DEFAULT;
-		video_format color_format_ = VIDEO_FORMAT_NONE;
-		bool color_parameters_set_ = false;
-		bool video_send_logged_ = false;
-		bool audio_send_logged_ = false;
-		bool video_receive_logged_ = false;
-		bool audio_receive_logged_ = false;
-	};
-
-	class SrtlaInput
-	{
-	public:
-		SrtlaInput(obs_source_t *source, uint16_t port) : source_(source), port_(port) {}
-
-		~SrtlaInput() { stop(); }
-
-		bool start()
-		{
-			if (thread_.joinable())
-				return false;
-			stopping_.store(false);
-			try
-			{
-				thread_ = std::thread(&SrtlaInput::run, this);
-			}
-			catch (const std::system_error &error)
-			{
-				blog(LOG_ERROR, "[obs-srtla-source] could not start receiver thread: %s",
-					 error.what());
-				return false;
-			}
-			return true;
-		}
-
-		void stop()
-		{
-			stopping_.store(true);
-			close_socket(active_socket_);
-			close_socket(listener_);
-			if (thread_.joinable())
-				thread_.join();
-		}
-
-	private:
-		void run()
-		{
-			SrtRuntime runtime;
-			if (!runtime.ready())
-			{
-				blog(LOG_ERROR, "[obs-srtla-source] libsrt startup failed");
-				return;
-			}
-			const SRTSOCKET listener = srt_create_socket();
-			if (listener == SRT_INVALID_SOCK)
-			{
-				blog(LOG_ERROR, "[obs-srtla-source] could not create local SRT socket");
-				return;
-			}
-			listener_.store(listener);
-			int timeout_ms = 250;
-			if (srt_setsockflag(listener, SRTO_RCVTIMEO, &timeout_ms,
-								sizeof(timeout_ms)) == SRT_ERROR)
-			{
-				blog(LOG_ERROR, "[obs-srtla-source] could not configure local SRT listener: %s",
-					 srt_getlasterror_str());
-				close_socket(listener_);
-				return;
-			}
-			sockaddr_in address{};
-			address.sin_family = AF_INET;
-			address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-			address.sin_port = 0;
-			if (srt_bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) ==
-					SRT_ERROR ||
-				srt_listen(listener, 1) == SRT_ERROR)
-			{
-				blog(LOG_ERROR, "[obs-srtla-source] could not bind local SRT listener: %s",
-					 srt_getlasterror_str());
-				close_socket(listener_);
-				return;
-			}
-			sockaddr_in bound_address{};
-			int address_length = sizeof(bound_address);
-			if (srt_getsockname(listener, reinterpret_cast<sockaddr *>(&bound_address),
-								&address_length) == SRT_ERROR)
-			{
-				blog(LOG_ERROR, "[obs-srtla-source] could not read local SRT port: %s",
-					 srt_getlasterror_str());
-				close_socket(listener_);
-				return;
-			}
-
-			srtla_embed::EmbeddedSrtlaReceiver receiver;
-			if (!receiver.start(port_, ntohs(bound_address.sin_port)))
-			{
-				close_socket(listener_);
-				return;
-			}
-			blog(LOG_INFO, "[obs-srtla-source] listening for SRTLA on UDP port %u", port_);
-
-			while (!stopping_.load() && receiver.running())
-			{
-				sockaddr_storage peer{};
-				int peer_length = sizeof(peer);
-				const SRTSOCKET active_socket =
-					srt_accept(listener, reinterpret_cast<sockaddr *>(&peer), &peer_length);
-				active_socket_.store(active_socket);
-				if (active_socket == SRT_INVALID_SOCK)
-				{
-					const int error = srt_getlasterror(nullptr);
-					if (!stopping_.load() && error != SRT_ETIMEOUT &&
-						error != SRT_EASYNCRCV)
-						blog(LOG_WARNING, "[obs-srtla-source] SRT accept failed: %s",
-							 srt_getlasterror_str());
-					continue;
-				}
-				int receive_timeout = 1000;
-				if (srt_setsockflag(active_socket, SRTO_RCVTIMEO, &receive_timeout,
-									sizeof(receive_timeout)) == SRT_ERROR)
-				{
-					if (!stopping_.load())
-						blog(LOG_WARNING,
-							 "[obs-srtla-source] could not configure SRT stream: %s",
-							 srt_getlasterror_str());
-					close_socket(active_socket_);
-					continue;
-				}
-				MediaDecoder decoder(source_);
-				if (!decoder.run(active_socket, stopping_) && !stopping_.load())
-					blog(LOG_WARNING, "[obs-srtla-source] could not decode SRT media");
-				close_socket(active_socket_);
-			}
-			if (!stopping_.load() && !receiver.running())
-				blog(LOG_ERROR, "[obs-srtla-source] SRTLA receiver stopped unexpectedly");
-
-			receiver.stop();
-			close_socket(active_socket_);
-			close_socket(listener_);
-		}
-
-		obs_source_t *source_;
-		uint16_t port_;
-		std::atomic<bool> stopping_{false};
-		std::atomic<SRTSOCKET> listener_{SRT_INVALID_SOCK};
-		std::atomic<SRTSOCKET> active_socket_{SRT_INVALID_SOCK};
-		std::thread thread_;
-	};
-
-	struct Source
-	{
-		obs_source_t *source = nullptr;
-		uint16_t port = 5000;
-		std::unique_ptr<SrtlaInput> input;
-	};
-
-	static uint16_t configured_port(obs_data_t *settings)
-	{
-		const int64_t port = obs_data_get_int(settings, setting_port);
-		return port >= 1 && port <= 65535 ? static_cast<uint16_t>(port) : 5000;
+		if (sws_scale(scaler_.get(), decoded->data, decoded->linesize, 0, decoded->height, converted_->data,
+			      converted_->linesize) <= 0)
+			return nullptr;
+		return converted_.get();
 	}
 
-	static void start_input(Source *source)
+	void output_video(const AVFrame *decoded, uint64_t timestamp)
 	{
-		source->input = std::make_unique<SrtlaInput>(source->source, source->port);
-		if (!source->input->start())
-			source->input.reset();
-	}
+		video_format format = obs_video_format(decoded->format);
+		const AVFrame *image = decoded;
+		if (format == VIDEO_FORMAT_NONE) {
+			format = VIDEO_FORMAT_I420;
+			image = convert_to_i420(decoded);
+			if (!image)
+				return;
+		}
 
-	static const char *source_get_name(void *)
-	{
-		return obs_module_text("SRTLASource");
-	}
-
-	static void *source_create(obs_data_t *settings, obs_source_t *obs_source)
-	{
-		auto source = std::make_unique<Source>();
-		source->source = obs_source;
-		source->port = configured_port(settings);
-		start_input(source.get());
-		return source.release();
-	}
-
-	static void source_destroy(void *data)
-	{
-		delete static_cast<Source *>(data);
-	}
-
-	static void source_update(void *data, obs_data_t *settings)
-	{
-		auto *source = static_cast<Source *>(data);
-		const uint16_t port = configured_port(settings);
-		if (source->port == port)
+		// A zeroed color matrix renders black, so it is always filled in;
+		// it is recomputed only when the stream's color properties change.
+		const video_colorspace space = obs_colorspace(decoded);
+		const video_range_type range = decoded->color_range == AVCOL_RANGE_JPEG ? VIDEO_RANGE_FULL
+											 : VIDEO_RANGE_PARTIAL;
+		if (format != frame_.format || space != color_space_ || range != color_range_) {
+			frame_.format = format;
+			color_space_ = space;
+			color_range_ = range;
+			color_valid_ = video_format_get_parameters_for_format(space, range, format, frame_.color_matrix,
+									      frame_.color_range_min,
+									      frame_.color_range_max);
+			plugin_log(color_valid_ ? LOG_INFO : LOG_WARNING,
+				   "video format: %s -> %s, colorspace %d, %s range%s",
+				   av_get_pix_fmt_name(static_cast<AVPixelFormat>(decoded->format)),
+				   get_video_format_name(format), static_cast<int>(space),
+				   range == VIDEO_RANGE_FULL ? "full" : "partial",
+				   color_valid_ ? "" : " (unsupported, frames dropped)");
+		}
+		if (!color_valid_)
 			return;
 
-		if (source->input)
-			source->input->stop();
-		source->input.reset();
-		source->port = port;
-		start_input(source);
+		frame_.width = static_cast<uint32_t>(image->width);
+		frame_.height = static_cast<uint32_t>(image->height);
+		frame_.timestamp = timestamp;
+		frame_.full_range = range == VIDEO_RANGE_FULL;
+		frame_.trc = obs_trc(decoded->color_trc);
+		for (size_t plane = 0; plane < MAX_AV_PLANES; ++plane) {
+			frame_.data[plane] = image->data[plane];
+			frame_.linesize[plane] = static_cast<uint32_t>(image->linesize[plane]);
+		}
+		obs_source_output_video(source_, &frame_);
 	}
 
-	static obs_properties_t *source_properties(void *)
+	// swr_convert_frame() configures the resampler from the frames and
+	// reports AVERROR_INPUT_CHANGED when the input format changes.
+	const AVFrame *downmix_to_stereo(const AVFrame *decoded)
 	{
-		obs_properties_t *properties = obs_properties_create();
-		obs_properties_add_int(properties, setting_port, obs_module_text("Port"), 1, 65535, 1);
-		return properties;
+		if (!resampler_)
+			resampler_.reset(swr_alloc());
+		if (!downmixed_)
+			downmixed_.reset(av_frame_alloc());
+		if (!resampler_ || !downmixed_)
+			return nullptr;
+		if (!downmix_logged_) {
+			downmix_logged_ = true;
+			char layout[64] = {};
+			av_channel_layout_describe(&decoded->ch_layout, layout, sizeof(layout));
+			plugin_log(LOG_INFO, "audio %s %s is downmixed to stereo",
+				   av_get_sample_fmt_name(static_cast<AVSampleFormat>(decoded->format)), layout);
+		}
+		int result = AVERROR_INPUT_CHANGED;
+		for (int attempt = 0; attempt < 2 && result == AVERROR_INPUT_CHANGED; ++attempt) {
+			if (attempt > 0)
+				swr_close(resampler_.get());
+			av_frame_unref(downmixed_.get());
+			downmixed_->format = AV_SAMPLE_FMT_FLTP;
+			downmixed_->sample_rate = decoded->sample_rate;
+			av_channel_layout_default(&downmixed_->ch_layout, 2);
+			result = swr_convert_frame(resampler_.get(), downmixed_.get(), decoded);
+		}
+		return result < 0 ? nullptr : downmixed_.get();
 	}
 
-	static void source_defaults(obs_data_t *settings)
+	void output_audio(const AVFrame *decoded, uint64_t timestamp)
 	{
-		obs_data_set_default_int(settings, setting_port, 5000);
+		const AVFrame *samples = decoded;
+		obs_source_audio audio{};
+		audio.format = obs_audio_format(decoded->format);
+		audio.speakers = obs_speakers(decoded->ch_layout);
+		if (audio.format == AUDIO_FORMAT_UNKNOWN || audio.speakers == SPEAKERS_UNKNOWN) {
+			samples = downmix_to_stereo(decoded);
+			if (!samples)
+				return;
+			audio.format = AUDIO_FORMAT_FLOAT_PLANAR;
+			audio.speakers = SPEAKERS_STEREO;
+		}
+		audio.samples_per_sec = static_cast<uint32_t>(samples->sample_rate);
+		audio.frames = static_cast<uint32_t>(samples->nb_samples);
+		audio.timestamp = timestamp;
+		const int planes = av_sample_fmt_is_planar(static_cast<AVSampleFormat>(samples->format))
+					   ? samples->ch_layout.nb_channels
+					   : 1;
+		for (int plane = 0; plane < planes; ++plane)
+			audio.data[plane] = samples->extended_data[plane];
+		obs_source_output_audio(source_, &audio);
 	}
 
-	static obs_source_info source_info = {
-		.id = "srtla_source",
-		.type = OBS_SOURCE_TYPE_INPUT,
-		.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_AUDIO,
-		.get_name = source_get_name,
-		.create = source_create,
-		.destroy = source_destroy,
-		.get_defaults = source_defaults,
-		.get_properties = source_properties,
-		.update = source_update,
-		.icon_type = OBS_ICON_TYPE_CAMERA,
-	};
+	obs_source_t *source_;
+	AvPtr<AVCodecContext> video_;
+	AvPtr<AVCodecContext> audio_;
+	AvPtr<SwsContext> scaler_;
+	AvPtr<AVFrame> converted_;
+	AvPtr<SwrContext> resampler_;
+	AvPtr<AVFrame> downmixed_;
+	obs_source_frame frame_{};
+	video_colorspace color_space_ = VIDEO_CS_DEFAULT;
+	video_range_type color_range_ = VIDEO_RANGE_DEFAULT;
+	bool color_valid_ = false;
+	bool origin_set_ = false;
+	int64_t media_origin_ns_ = 0;
+	int64_t clock_origin_ns_ = 0;
+	bool decode_error_logged_ = false;
+	bool downmix_logged_ = false;
+};
+
+// Loopback SRT listener on an ephemeral port that the SRTLA receiver feeds.
+SRTSOCKET open_local_listener(uint16_t &port)
+{
+	const SRTSOCKET listener = srt_create_socket();
+	if (listener == SRT_INVALID_SOCK) {
+		plugin_log(LOG_ERROR, "could not create local SRT socket: %s", srt_getlasterror_str());
+		return SRT_INVALID_SOCK;
+	}
+	sockaddr_in address{};
+	address.sin_family = AF_INET;
+	address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	int address_length = sizeof(address);
+	if (srt_setsockflag(listener, SRTO_RCVTIMEO, &srt_timeout_ms, sizeof(srt_timeout_ms)) == SRT_ERROR ||
+	    srt_bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == SRT_ERROR ||
+	    srt_listen(listener, 1) == SRT_ERROR ||
+	    srt_getsockname(listener, reinterpret_cast<sockaddr *>(&address), &address_length) == SRT_ERROR) {
+		plugin_log(LOG_ERROR, "could not open local SRT listener: %s", srt_getlasterror_str());
+		srt_close(listener);
+		return SRT_INVALID_SOCK;
+	}
+	port = ntohs(address.sin_port);
+	return listener;
+}
+
+uint16_t configured_port(obs_data_t *settings)
+{
+	const long long port = obs_data_get_int(settings, setting_port);
+	return port >= 1 && port <= 65535 ? static_cast<uint16_t>(port) : default_port;
+}
+
+// One OBS source: a worker thread that runs the SRTLA receiver and decodes
+// SRT connections one at a time until the source is stopped.
+class SrtlaSource {
+public:
+	explicit SrtlaSource(obs_source_t *source) : source_(source) {}
+	~SrtlaSource() { stop(); }
+
+	SrtlaSource(const SrtlaSource &) = delete;
+	SrtlaSource &operator=(const SrtlaSource &) = delete;
+
+	void update(obs_data_t *settings)
+	{
+		const uint16_t port = configured_port(settings);
+		if (thread_.joinable() && port == port_)
+			return;
+		stop();
+		port_ = port;
+		stopping_ = false;
+		try {
+			thread_ = std::thread(&SrtlaSource::run, this);
+		} catch (const std::system_error &error) {
+			plugin_log(LOG_ERROR, "could not start receiver thread: %s", error.what());
+		}
+	}
+
+private:
+	void stop()
+	{
+		stopping_ = true;
+		// Closing the sockets unblocks accept/receive in the worker.
+		close_socket(stream_);
+		close_socket(listener_);
+		if (thread_.joinable())
+			thread_.join();
+	}
+
+	void run()
+	{
+		if (start_srt())
+			serve();
+		close_socket(stream_);
+		close_socket(listener_);
+	}
+
+	void serve()
+	{
+		uint16_t srt_port = 0;
+		const SRTSOCKET listener = open_local_listener(srt_port);
+		if (listener == SRT_INVALID_SOCK)
+			return;
+		listener_ = listener;
+
+		srtla_embed::EmbeddedSrtlaReceiver receiver;
+		if (!receiver.start(port_, srt_port))
+			return;
+		plugin_log(LOG_INFO, "listening for SRTLA on UDP port %u", port_);
+
+		while (!stopping_ && receiver.running()) {
+			const SRTSOCKET stream = srt_accept(listener, nullptr, nullptr);
+			if (stream == SRT_INVALID_SOCK) {
+				const int error = srt_getlasterror(nullptr);
+				if (!stopping_ && error != SRT_ETIMEOUT && error != SRT_EASYNCRCV)
+					plugin_log(LOG_WARNING, "SRT accept failed: %s", srt_getlasterror_str());
+				continue;
+			}
+			stream_ = stream;
+			if (srt_setsockflag(stream, SRTO_RCVTIMEO, &srt_timeout_ms, sizeof(srt_timeout_ms)) ==
+			    SRT_ERROR) {
+				close_socket(stream_);
+				continue;
+			}
+			plugin_log(LOG_INFO, "SRT stream connected");
+			MediaDecoder(source_).run(stream, stopping_);
+			close_socket(stream_);
+			if (!stopping_)
+				plugin_log(LOG_INFO, "SRT stream ended");
+		}
+		if (!stopping_)
+			plugin_log(LOG_ERROR, "SRTLA receiver stopped unexpectedly");
+	}
+
+	obs_source_t *source_;
+	uint16_t port_ = default_port;
+	std::atomic<bool> stopping_{false};
+	std::atomic<SRTSOCKET> listener_{SRT_INVALID_SOCK};
+	std::atomic<SRTSOCKET> stream_{SRT_INVALID_SOCK};
+	std::thread thread_;
+};
+
+const char *source_get_name(void *)
+{
+	return obs_module_text("SRTLASource");
+}
+
+void *source_create(obs_data_t *settings, obs_source_t *obs_source)
+{
+	auto *source = new SrtlaSource(obs_source);
+	source->update(settings);
+	return source;
+}
+
+void source_destroy(void *data)
+{
+	delete static_cast<SrtlaSource *>(data);
+}
+
+void source_update(void *data, obs_data_t *settings)
+{
+	static_cast<SrtlaSource *>(data)->update(settings);
+}
+
+obs_properties_t *source_properties(void *)
+{
+	obs_properties_t *properties = obs_properties_create();
+	obs_properties_add_int(properties, setting_port, obs_module_text("Port"), 1, 65535, 1);
+	return properties;
+}
+
+void source_defaults(obs_data_t *settings)
+{
+	obs_data_set_default_int(settings, setting_port, default_port);
+}
+
+obs_source_info source_info = {
+	.id = "srtla_source",
+	.type = OBS_SOURCE_TYPE_INPUT,
+	.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_AUDIO,
+	.get_name = source_get_name,
+	.create = source_create,
+	.destroy = source_destroy,
+	.get_defaults = source_defaults,
+	.get_properties = source_properties,
+	.update = source_update,
+	.icon_type = OBS_ICON_TYPE_CAMERA,
+};
 
 } // namespace
 
-extern "C" void srtla_source_register(void)
+bool obs_module_load(void)
 {
+	srt_setloghandler(nullptr, srt_log_to_obs);
+	srt_setlogflags(SRT_LOGF_DISABLE_TIME | SRT_LOGF_DISABLE_THREADNAME | SRT_LOGF_DISABLE_SEVERITY |
+			SRT_LOGF_DISABLE_EOL);
+	srt_setloglevel(LOG_ERR);
 	obs_register_source(&source_info);
+	plugin_log(LOG_INFO, "plugin loaded");
+	return true;
+}
+
+void obs_module_unload(void)
+{
+	if (srt_started)
+		srt_cleanup();
 }

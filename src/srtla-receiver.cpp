@@ -1,6 +1,6 @@
 #include "srtla-receiver.hpp"
 
-#include <obs-module.h>
+#include "plugin-log.hpp"
 
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -18,6 +18,7 @@
 #include <system_error>
 #include <thread>
 
+#include <spdlog/details/null_mutex.h>
 #include <spdlog/sinks/base_sink.h>
 #include <spdlog/spdlog.h>
 
@@ -44,7 +45,8 @@ constexpr int max_epoll_events = 16;
 // same time, so packet processing is serialized across all of them.
 std::mutex upstream_mutex;
 
-class ObsLogSink final : public spdlog::sinks::base_sink<std::mutex> {
+// blog() is thread-safe, so the sink needs no lock of its own.
+class ObsLogSink final : public spdlog::sinks::base_sink<spdlog::details::null_mutex> {
 protected:
 	void sink_it_(const spdlog::details::log_msg &msg) override
 	{
@@ -63,8 +65,8 @@ protected:
 		default:
 			break;
 		}
-		const std::string text(msg.payload.data(), msg.payload.size());
-		blog(level, "[obs-srtla-source] srtla: %s", text.c_str());
+		plugin_log(level, "srtla: %.*s", static_cast<int>(msg.payload.size()),
+			   msg.payload.data());
 	}
 
 	void flush_() override {}
@@ -92,12 +94,12 @@ void set_socket_buffers(int fd)
 {
 	int size = RECV_BUF_SIZE;
 	if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)) != 0)
-		blog(LOG_WARNING, "[obs-srtla-source] could not set SRTLA receive buffer: %s",
-		     strerror(errno));
+		plugin_log(LOG_WARNING, "could not set SRTLA receive buffer: %s",
+			   strerror(errno));
 	size = SEND_BUF_SIZE;
 	if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size)) != 0)
-		blog(LOG_WARNING, "[obs-srtla-source] could not set SRTLA send buffer: %s",
-		     strerror(errno));
+		plugin_log(LOG_WARNING, "could not set SRTLA send buffer: %s",
+			   strerror(errno));
 }
 
 } // namespace
@@ -123,8 +125,8 @@ struct EmbeddedSrtlaReceiver::Impl {
 		try {
 			run_upstream_loop();
 		} catch (const std::exception &error) {
-			blog(LOG_ERROR, "[obs-srtla-source] SRTLA receiver failed: %s",
-			     error.what());
+			plugin_log(LOG_ERROR, "SRTLA receiver failed: %s",
+				   error.what());
 		}
 		running.store(false);
 	}
@@ -156,8 +158,8 @@ struct EmbeddedSrtlaReceiver::Impl {
 			if (count < 0) {
 				if (errno == EINTR)
 					continue;
-				blog(LOG_ERROR, "[obs-srtla-source] SRTLA epoll_wait failed: %s",
-				     strerror(errno));
+				plugin_log(LOG_ERROR, "SRTLA epoll_wait failed: %s",
+					   strerror(errno));
 				break;
 			}
 			if (stopping.load())
@@ -222,7 +224,7 @@ bool EmbeddedSrtlaReceiver::start(uint16_t srtla_port, uint16_t srt_port)
 	if (srtla::utils::NetworkUtils::resolve_srt_address("127.0.0.1", srt_port_text.c_str(),
 							    &impl.srt_addr, RECV_BUF_SIZE,
 							    SEND_BUF_SIZE) < 0) {
-		blog(LOG_ERROR, "[obs-srtla-source] could not resolve local SRT listener");
+		plugin_log(LOG_ERROR, "could not resolve local SRT listener");
 		return false;
 	}
 
@@ -230,16 +232,16 @@ bool EmbeddedSrtlaReceiver::start(uint16_t srtla_port, uint16_t srt_port)
 	impl.srtla_sock = socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 	impl.wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 	if (impl.epoll_fd < 0 || impl.srtla_sock < 0 || impl.wake_fd < 0) {
-		blog(LOG_ERROR, "[obs-srtla-source] could not create SRTLA sockets: %s",
-		     strerror(errno));
+		plugin_log(LOG_ERROR, "could not create SRTLA sockets: %s",
+			   strerror(errno));
 		impl.close_all();
 		return false;
 	}
 
 	int v6only = 0;
 	if (setsockopt(impl.srtla_sock, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) != 0)
-		blog(LOG_WARNING, "[obs-srtla-source] SRTLA socket is IPv6-only: %s",
-		     strerror(errno));
+		plugin_log(LOG_WARNING, "SRTLA socket is IPv6-only: %s",
+			   strerror(errno));
 	set_socket_buffers(impl.srtla_sock);
 
 	sockaddr_in6 listen_addr{};
@@ -248,8 +250,8 @@ bool EmbeddedSrtlaReceiver::start(uint16_t srtla_port, uint16_t srt_port)
 	listen_addr.sin6_port = htons(srtla_port);
 	if (bind(impl.srtla_sock, reinterpret_cast<const sockaddr *>(&listen_addr),
 		 sizeof(listen_addr)) != 0) {
-		blog(LOG_ERROR, "[obs-srtla-source] could not bind SRTLA UDP port %u: %s",
-		     srtla_port, strerror(errno));
+		plugin_log(LOG_ERROR, "could not bind SRTLA UDP port %u: %s",
+			   srtla_port, strerror(errno));
 		impl.close_all();
 		return false;
 	}
@@ -258,8 +260,8 @@ bool EmbeddedSrtlaReceiver::start(uint16_t srtla_port, uint16_t srt_port)
 						  nullptr) != 0 ||
 	    srtla::utils::NetworkUtils::epoll_add(impl.epoll_fd, impl.wake_fd, EPOLLIN,
 						  &impl) != 0) {
-		blog(LOG_ERROR, "[obs-srtla-source] could not register SRTLA sockets: %s",
-		     strerror(errno));
+		plugin_log(LOG_ERROR, "could not register SRTLA sockets: %s",
+			   strerror(errno));
 		impl.close_all();
 		return false;
 	}
@@ -268,8 +270,8 @@ bool EmbeddedSrtlaReceiver::start(uint16_t srtla_port, uint16_t srt_port)
 	try {
 		impl.thread = std::thread(&Impl::loop, &impl);
 	} catch (const std::system_error &error) {
-		blog(LOG_ERROR, "[obs-srtla-source] could not start SRTLA thread: %s",
-		     error.what());
+		plugin_log(LOG_ERROR, "could not start SRTLA thread: %s",
+			   error.what());
 		impl.running.store(false);
 		impl.close_all();
 		return false;
@@ -284,8 +286,8 @@ void EmbeddedSrtlaReceiver::stop()
 	if (impl.wake_fd >= 0) {
 		const uint64_t one = 1;
 		if (write(impl.wake_fd, &one, sizeof(one)) < 0 && errno != EAGAIN)
-			blog(LOG_DEBUG, "[obs-srtla-source] SRTLA wakeup failed: %s",
-			     strerror(errno));
+			plugin_log(LOG_DEBUG, "SRTLA wakeup failed: %s",
+				   strerror(errno));
 	}
 	if (impl.thread.joinable())
 		impl.thread.join();

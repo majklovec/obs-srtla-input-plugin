@@ -10,17 +10,17 @@ if ! command -v cmake >/dev/null 2>&1; then
 fi
 
 if ! command -v ninja >/dev/null 2>&1; then
-	printf 'Error: Ninja is not installed. Run scripts/install-and-build.sh first.\n' >&2
+	printf 'Error: Ninja is not installed. Run scripts/deps-and-build.sh first.\n' >&2
 	exit 1
 fi
 
 if ! command -v pkg-config >/dev/null 2>&1; then
-	printf 'Error: pkg-config is not installed. Run scripts/install-and-build.sh first.\n' >&2
+	printf 'Error: pkg-config is not installed. Run scripts/deps-and-build.sh first.\n' >&2
 	exit 1
 fi
 
 if ! command -v git >/dev/null 2>&1; then
-	printf 'Error: git is required to fetch the embedded SRTLA sources. Run scripts/install-and-build.sh first.\n' >&2
+	printf 'Error: git is required to fetch the embedded SRTLA sources. Run scripts/deps-and-build.sh first.\n' >&2
 	exit 1
 fi
 
@@ -38,7 +38,7 @@ done
 
 if ((${#missing[@]} > 0)); then
 	printf 'Error: missing development packages: %s\n' "${missing[*]}" >&2
-	printf 'Run scripts/install-and-build.sh to install them.\n' >&2
+	printf 'Run scripts/deps-and-build.sh to install them.\n' >&2
 	exit 1
 fi
 

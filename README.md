@@ -23,14 +23,19 @@ program.
   ephemeral loopback port. The embedded receiver accepts the bonded SRTLA
   links on the configured UDP port and forwards the reassembled SRT traffic
   to that listener. FFmpeg reads the SRT payload as MPEG-TS, demuxes it,
-  decodes H.264/AAC, converts video to NV12 and audio to planar float, and
-  sends timestamped frames to OBS.
+  decodes it (e.g. H.264/HEVC with AAC), and sends timestamped frames to OBS.
+  Decoded video and audio are passed to OBS in their native format whenever
+  OBS supports it (8/10-bit YUV 4:2:0, 4:2:2, 4:4:4, NV12, P010, HDR PQ/HLG;
+  integer or float audio in mono, stereo, 2.1, 4.0, 4.1, 5.1 or 7.1), so the
+  common case needs no conversion. Other pixel formats are converted to I420
+  with swscale, and other audio layouts are downmixed to stereo with
+  swresample.
 
 The upstream receiver uses epoll, so the plugin is Linux-only.
 
 At runtime the plugin needs only libraries that OBS itself already provides:
-libobs, FFmpeg (`libavformat`, `libavcodec`, `libavutil`, `libswresample` and
-`libswscale`), and the C/C++ runtime. It does not need a system libsrt,
+libobs, FFmpeg 5.1 or newer (`libavformat`, `libavcodec`, `libavutil`,
+`libswresample` and `libswscale`), and the C/C++ runtime. It does not need a system libsrt,
 libssl/libcrypto, or `srtla_rec`.
 
 ## Build
@@ -40,7 +45,7 @@ Ninja, git and the OBS, FFmpeg and OpenSSL development packages, then builds
 the plugin:
 
 ```sh
-./scripts/install-and-build.sh
+./scripts/deps-and-build.sh
 ```
 
 The script requires `sudo` for system package installation. On the first
@@ -70,6 +75,31 @@ The preset builds in `Release` mode and strips the module after linking, so
 the output is a production binary of about 6 MB with no debug info. To keep
 debug symbols, configure with `-DSTRIP_PLUGIN=OFF`, or use a
 `RelWithDebInfo` build, which is never stripped.
+
+## Test
+
+`test/e2e.sh` runs end-to-end tests against the built plugin without starting
+OBS. Each case streams a generated clip through the real SRTLA path
+(`ffmpeg` → SRT → `srtla_send` → plugin). A headless OBS host
+(`test/harness.cpp`) loads the module and records every frame the plugin
+passes to OBS:
+
+```sh
+./test/e2e.sh                          # tests build_x86_64/obs-srtla-source.so
+./test/e2e.sh path/to/obs-srtla-source.so reconnect   # one case, another build
+```
+
+The cases cover H.264/HEVC, 8/10-bit, 4:2:0/4:2:2 and the swscale fallback,
+HDR (HLG), and mono, stereo and 5.1 audio, plus downmixed 5.0 and 3.0.
+They also test reconnecting, destroying a source mid-stream, changing the
+port, and running two sources at once. The suite also fails if update or
+destroy blocks for more than 500 ms.
+
+The tests need `ffmpeg` with SRT, libx264 and libx265 support, plus the
+normal build tools. On the first run the script builds the harness, fetches
+and builds `srtla_send` at the pinned SRTLA revision, and generates the clips
+in `build_e2e/`, which later runs reuse. A full run takes about two minutes.
+Per-case logs are kept in `build_e2e/logs/`.
 
 ## Install into OBS on Linux
 
