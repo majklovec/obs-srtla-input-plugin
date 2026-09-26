@@ -19,13 +19,18 @@ if ! command -v pkg-config >/dev/null 2>&1; then
 	exit 1
 fi
 
+if ! command -v git >/dev/null 2>&1; then
+	printf 'Error: git is required to fetch the embedded SRTLA sources. Run scripts/install-and-build.sh first.\n' >&2
+	exit 1
+fi
+
 if ! cmake --version | head -n 1 | grep -Eq 'version ([4-9]\.|3\.(2[8-9]|[3-9][0-9])\.)'; then
 	printf 'Error: CMake 3.28 or newer is required.\n' >&2
 	exit 1
 fi
 
 missing=()
-for package in libobs libavformat libavcodec libavutil libswresample libswscale srt; do
+for package in libobs libavformat libavcodec libavutil libswresample libswscale libcrypto; do
 	if ! pkg-config --exists "$package"; then
 		missing+=("$package")
 	fi

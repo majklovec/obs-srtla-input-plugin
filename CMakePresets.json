@@ -18,7 +18,7 @@
         "rhs": "Linux"
       },
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_INSTALL_LIBDIR": "lib/CMAKE_SYSTEM_PROCESSOR-linux-gnu"
       }
     }
@@ -28,7 +28,7 @@
       "name": "ubuntu-x86_64",
       "configurePreset": "ubuntu-x86_64",
       "displayName": "Ubuntu x86_64",
-      "configuration": "RelWithDebInfo"
+      "configuration": "Release"
     }
   ]
 }
