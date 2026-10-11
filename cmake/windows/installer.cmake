@@ -6,9 +6,12 @@
 # release/<name>-<version>-windows-x64-installer.exe.
 include_guard(GLOBAL)
 
+# Parentheses are not allowed in a literal $ENV{} name; reference it indirectly.
+set(_programfiles_x86_var "ProgramFiles(x86)")
+
 find_program(MAKENSIS_EXECUTABLE
   NAMES makensis
-  HINTS "$ENV{ProgramFiles\(x86\)}/NSIS" "$ENV{ProgramFiles}/NSIS" "$ENV{ProgramW6432}/NSIS"
+  HINTS "$ENV{${_programfiles_x86_var}}/NSIS" "$ENV{ProgramFiles}/NSIS" "$ENV{ProgramW6432}/NSIS"
         "$ENV{LOCALAPPDATA}/Programs/NSIS" "$ENV{ChocolateyInstall}/bin" "C:/Program Files (x86)/NSIS"
   DOC "NSIS compiler (makensis.exe) used by the installer target")
 

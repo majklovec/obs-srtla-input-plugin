@@ -26,7 +26,9 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     outputs:
-      new_tag: ${{ steps.tag.outputs.new_tag }}
+      # With DEFAULT_BUMP none the action still reports the previous tag as
+      # new_tag; only expose it when a bump actually created a new tag.
+      new_tag: ${{ steps.tag.outputs.part != 'none' && steps.tag.outputs.new_tag || '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -46,7 +48,7 @@ jobs:
     if: >-
       always() &&
       (github.event_name == 'pull_request' ||
-       (needs.version.result == 'success' && needs.version.outputs.new_tag != ''))
+       needs.version.result == 'success')
     strategy:
       fail-fast: false
       matrix:
