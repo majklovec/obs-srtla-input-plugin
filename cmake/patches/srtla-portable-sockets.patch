@@ -217,8 +217,8 @@ index 4b51e46..7f5ef18 100644
              return;
          }
  
-+#ifdef _WIN32
-+        // Winsock has no sendmmsg(); send to each connection individually.
++#if defined(_WIN32) || defined(__APPLE__)
++        // Windows and macOS have no sendmmsg(); send individually.
 +        size_t msg_count = 0;
 +        int sent = 0;
 +        for (const auto &conn : connections) {
@@ -362,8 +362,8 @@ index 72d886f..f0c4afc 100644
 +    int lens[RECV_BATCH_SIZE];
 +    int num_msgs = 0;
 +
-+#ifdef _WIN32
-+    // Winsock has no recvmmsg(); drain up to a batch of datagrams one by one.
++#if defined(_WIN32) || defined(__APPLE__)
++    // Windows and macOS have no recvmmsg(); drain datagrams individually.
 +    while (num_msgs < RECV_BATCH_SIZE) {
 +        socklen_t addr_len = kAddrLen;
 +        int len = srtla_recvfrom(srtla_socket_, bufs[num_msgs], MTU, 0,

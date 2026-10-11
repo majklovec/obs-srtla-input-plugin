@@ -142,6 +142,16 @@ if(NOT OS_WINDOWS)
 
     set(SRT_PREFIX "${CMAKE_BINARY_DIR}/srt-install")
     set(SRT_STATIC_LIB "${SRT_PREFIX}/lib/libsrt.a")
+    set(SRT_PLATFORM_CMAKE_ARGS)
+    if(OS_MACOS)
+        list(APPEND SRT_PLATFORM_CMAKE_ARGS
+            -DCMAKE_C_VISIBILITY_PRESET=hidden
+            -DCMAKE_CXX_VISIBILITY_PRESET=hidden
+            -DCMAKE_VISIBILITY_INLINES_HIDDEN=ON
+            -DCMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}
+        )
+    endif()
     ExternalProject_Add(srt_external
         GIT_REPOSITORY https://github.com/Haivision/srt.git
         GIT_TAG ${SRT_GIT_TAG}
@@ -162,6 +172,7 @@ if(NOT OS_WINDOWS)
             -DOPENSSL_USE_STATIC_LIBS=TRUE
             -DENABLE_UNITTESTS=OFF
             -DENABLE_CXX_DEPS=OFF
+            ${SRT_PLATFORM_CMAKE_ARGS}
         BUILD_BYPRODUCTS ${SRT_STATIC_LIB}
     )
     file(MAKE_DIRECTORY "${SRT_PREFIX}/include")
@@ -183,7 +194,7 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
 )
 if(OS_WINDOWS)
     target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ws2_32)
-else()
+elseif(OS_LINUX)
     # Keep embedded libsrt/libcrypto symbols private: FFmpeg loads the system
     # libsrt into the same OBS process, and the two must not interpose.
     target_link_options(${CMAKE_PROJECT_NAME} PRIVATE
@@ -191,6 +202,8 @@ else()
         "LINKER:-Bsymbolic"
         "LINKER:--no-undefined"
     )
+elseif(OS_MACOS)
+    target_link_options(${CMAKE_PROJECT_NAME} PRIVATE "LINKER:-undefined,error")
 endif()
 
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
@@ -226,8 +239,13 @@ endif()
 # Production builds ship a stripped module (no debug info or local symbols).
 option(STRIP_PLUGIN "Strip the plugin after building (Release/MinSizeRel)" ON)
 if(STRIP_PLUGIN AND CMAKE_STRIP AND NOT OS_WINDOWS)
+    if(OS_MACOS)
+        set(PLUGIN_STRIP_FLAGS -S -x)
+    else()
+        set(PLUGIN_STRIP_FLAGS --strip-unneeded)
+    endif()
     add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
-        COMMAND "$<$<CONFIG:Release,MinSizeRel>:${CMAKE_STRIP};--strip-unneeded;$<TARGET_FILE:${CMAKE_PROJECT_NAME}>>"
+        COMMAND "$<$<CONFIG:Release,MinSizeRel>:${CMAKE_STRIP};${PLUGIN_STRIP_FLAGS};$<TARGET_FILE:${CMAKE_PROJECT_NAME}>>"
         COMMAND_EXPAND_LISTS
         COMMENT "Stripping $<TARGET_FILE_NAME:${CMAKE_PROJECT_NAME}>"
         VERBATIM

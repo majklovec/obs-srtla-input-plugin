@@ -3,14 +3,15 @@
  *
  * The upstream receiver is written against Linux (BSD sockets + epoll). This
  * header gives it and the plugin one small API that maps to Winsock + wepoll on
- * Windows and to the native calls elsewhere. It is included from C (common.h)
- * and C++ code, so everything here is plain C.
+ * Windows, kqueue on macOS, and native calls on Linux. It is included from C
+ * (common.h) and C++ code, so everything here is plain C.
  */
 #pragma once
 
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -57,7 +58,56 @@ typedef uint32_t in_addr_t;
 #define htobe32(x) htonl(x)
 #define be32toh(x) ntohl(x)
 
-#else /* !_WIN32 */
+#elif defined(__APPLE__)
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/event.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+/* SRTLA uses the Linux epoll shape; map it to kqueue on macOS. */
+struct epoll_event {
+	uint32_t events;
+	union {
+		void *ptr;
+		int fd;
+		uint32_t u32;
+		uint64_t u64;
+	} data;
+};
+
+#define EPOLLIN 0x001
+#define EPOLLOUT 0x004
+#define EPOLLERR 0x008
+#define EPOLLHUP 0x010
+#define EPOLL_CTL_ADD 1
+#define EPOLL_CTL_DEL 2
+#define EPOLL_CTL_MOD 3
+#define EPOLL_CLOEXEC 0
+
+#ifndef SOCK_NONBLOCK
+#define SOCK_NONBLOCK 0
+#endif
+#ifndef SOCK_CLOEXEC
+#define SOCK_CLOEXEC 0
+#endif
+#ifndef MSG_DONTWAIT
+#define MSG_DONTWAIT 0
+#endif
+
+#ifndef htobe16
+#define htobe16(x) htons(x)
+#define be16toh(x) ntohs(x)
+#define htobe32(x) htonl(x)
+#define be32toh(x) ntohl(x)
+#endif
+
+#else /* !_WIN32 && !_APPLE */
 
 #include <arpa/inet.h>
 #include <endian.h>
@@ -248,6 +298,8 @@ static inline int srtla_epoll_create(void)
 #ifdef _WIN32
 	HANDLE handle = epoll_create1(0);
 	return handle == NULL ? -1 : (int)(intptr_t)handle;
+#elif defined(__APPLE__)
+	return kqueue();
 #else
 	return epoll_create1(EPOLL_CLOEXEC);
 #endif
@@ -257,6 +309,8 @@ static inline int srtla_epoll_close(int epfd)
 {
 #ifdef _WIN32
 	return epoll_close((HANDLE)(intptr_t)epfd);
+#elif defined(__APPLE__)
+	return close(epfd);
 #else
 	return close(epfd);
 #endif
@@ -266,6 +320,45 @@ static inline int srtla_epoll_ctl(int epfd, int op, int fd, struct epoll_event *
 {
 #ifdef _WIN32
 	return epoll_ctl((HANDLE)(intptr_t)epfd, op, SRTLA_SOCK(fd), event);
+#elif defined(__APPLE__)
+	if (op == EPOLL_CTL_DEL) {
+		struct kevent change;
+		int removed = 0;
+		const int filters[] = {EVFILT_READ, EVFILT_WRITE};
+		for (size_t i = 0; i < sizeof(filters) / sizeof(filters[0]); ++i) {
+			EV_SET(&change, (uintptr_t)fd, filters[i], EV_DELETE, 0, 0, NULL);
+			if (kevent(epfd, &change, 1, NULL, 0, NULL) == 0)
+				removed++;
+			else if (errno != ENOENT)
+				return -1;
+		}
+		if (removed == 0) {
+			errno = ENOENT;
+			return -1;
+		}
+		return 0;
+	}
+
+	if (op != EPOLL_CTL_ADD && op != EPOLL_CTL_MOD) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	struct kevent changes[2];
+	int count = 0;
+	if ((event->events & EPOLLIN) != 0) {
+		EV_SET(&changes[count++], (uintptr_t)fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0,
+		       event->data.ptr);
+	}
+	if ((event->events & EPOLLOUT) != 0) {
+		EV_SET(&changes[count++], (uintptr_t)fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0,
+		       event->data.ptr);
+	}
+	if (count == 0) {
+		errno = EINVAL;
+		return -1;
+	}
+	return kevent(epfd, changes, count, NULL, 0, NULL);
 #else
 	return epoll_ctl(epfd, op, fd, event);
 #endif
@@ -275,6 +368,36 @@ static inline int srtla_epoll_wait(int epfd, struct epoll_event *events, int max
 {
 #ifdef _WIN32
 	return epoll_wait((HANDLE)(intptr_t)epfd, events, maxevents, timeout_ms);
+#elif defined(__APPLE__)
+	if (maxevents <= 0) {
+		errno = EINVAL;
+		return -1;
+	}
+	struct kevent *ready = (struct kevent *)malloc((size_t)maxevents * sizeof(*ready));
+	if (ready == NULL)
+		return -1;
+	struct timespec timeout;
+	struct timespec *timeout_ptr = NULL;
+	if (timeout_ms >= 0) {
+		timeout.tv_sec = timeout_ms / 1000;
+		timeout.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
+		timeout_ptr = &timeout;
+	}
+	const int count = kevent(epfd, NULL, 0, ready, maxevents, timeout_ptr);
+	for (int i = 0; i < count; ++i) {
+		events[i].events = 0;
+		if (ready[i].filter == EVFILT_READ)
+			events[i].events |= EPOLLIN;
+		if (ready[i].filter == EVFILT_WRITE)
+			events[i].events |= EPOLLOUT;
+		if ((ready[i].flags & EV_EOF) != 0)
+			events[i].events |= EPOLLHUP;
+		if ((ready[i].flags & EV_ERROR) != 0)
+			events[i].events |= EPOLLERR;
+		events[i].data.ptr = ready[i].udata;
+	}
+	free(ready);
+	return count;
 #else
 	return epoll_wait(epfd, events, maxevents, timeout_ms);
 #endif
@@ -288,6 +411,8 @@ static inline int srtla_monotonic_time(struct timespec *ts)
 	ts->tv_sec = (time_t)(ms / 1000);
 	ts->tv_nsec = (long)(ms % 1000) * 1000000L;
 	return 0;
+#elif defined(__APPLE__)
+	return clock_gettime(CLOCK_MONOTONIC, ts);
 #else
 	return clock_gettime(CLOCK_MONOTONIC_COARSE, ts);
 #endif

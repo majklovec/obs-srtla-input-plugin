@@ -66,6 +66,11 @@ jobs:
             platform: windows
             artifact: obs-srtla-source-windows-x64
             e2e: false
+          - name: macOS x86_64
+            os: macos-15-intel
+            platform: macos
+            artifact: obs-srtla-source-macos-x86_64
+            e2e: false
     name: Build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     env:
@@ -92,7 +97,8 @@ jobs:
           if [[ -n "$version" ]]; then
             # Only the top-level plugin version (two-space indent), not the
             # dependency versions nested deeper in buildspec.json.
-            sed -i -E "s/^  \"version\": \"[^\"]*\"/  \"version\": \"$version\"/" buildspec.json
+            sed -i.bak -E "s/^  \"version\": \"[^\"]*\"/  \"version\": \"$version\"/" buildspec.json
+            rm buildspec.json.bak
           fi
           version="$(sed -nE 's/^  "version": "([^"]*)".*/\1/p' buildspec.json)"
           [[ -n "$version" ]] || { echo "No plugin version in buildspec.json" >&2; exit 1; }
@@ -113,6 +119,66 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build --parallel
+
+      - name: Provision OBS development environment (macOS)
+        id: obs-deps
+        if: matrix.platform == 'macos'
+        uses: norihiro/obs-studio-devel-action@4d9bd843ff3f720432ccab26bf913f1435bc6618
+        with:
+          obs: "31"
+          qt: true
+          arch: x86_64
+
+      - name: Install OpenSSL (macOS)
+        if: matrix.platform == 'macos'
+        run: brew install openssl@3
+
+      - name: Build (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        env:
+          OBS_CMAKE_OPTIONS: ${{ steps.obs-deps.outputs.PLUGIN_CMAKE_OPTIONS }}
+          MACOSX_DEPLOYMENT_TARGET: ${{ steps.obs-deps.outputs.MACOSX_DEPLOYMENT_TARGET }}
+        run: |
+          set -euo pipefail
+          deployment_target="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
+          cmake_args=(
+            -S .
+            -B build
+            -G Xcode
+            -DCMAKE_OSX_ARCHITECTURES=x86_64
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$deployment_target"
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+          )
+          [[ -n "$OBS_CMAKE_OPTIONS" ]] || { echo "OBS development action did not provide CMake options" >&2; exit 1; }
+          read -r -a obs_cmake_options <<< "$OBS_CMAKE_OPTIONS"
+          cmake "${cmake_args[@]}" "${obs_cmake_options[@]}"
+          cmake --build build --config Release --parallel
+          plugin="$(find build -type d -name obs-srtla-source.plugin -print -quit)"
+          [[ -n "$plugin" ]] || { echo "The build did not produce obs-srtla-source.plugin" >&2; exit 1; }
+          test -f "$plugin/Contents/MacOS/obs-srtla-source"
+
+      - name: Package (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --install build --config Release --prefix staging
+          plugin=staging/obs-srtla-source.plugin
+          licenses=staging/share/obs/obs-plugins/obs-srtla-source/licenses
+          test -d "$plugin/Contents/Resources/locale"
+          test -f "$plugin/Contents/Resources/locale/en-US.ini"
+          test -d "$licenses"
+          mkdir -p "$plugin/Contents/Resources/licenses"
+          cp "$licenses/"*.txt "$plugin/Contents/Resources/licenses/"
+          archive="dist/${{ matrix.artifact }}-$PLUGIN_VERSION.zip"
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent "$plugin" "$archive"
+          contents="$(unzip -Z1 "$archive")"
+          grep -Fq 'obs-srtla-source.plugin/Contents/Resources/locale/en-US.ini' <<< "$contents"
+          for license in srtla spdlog libsrt; do
+            grep -Fq "obs-srtla-source.plugin/Contents/Resources/licenses/LICENSE-$license.txt" <<< "$contents"
+          done
 
       - name: Test (Linux)
         if: matrix.e2e

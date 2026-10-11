@@ -1,7 +1,8 @@
 # OBS SRTLA Source
 
 An OBS input source that receives bonded SRTLA streams and outputs decoded
-video and audio to OBS. It builds for Linux and Windows (x64).
+video and audio to OBS. It builds for Linux (x86_64 and arm64), Windows x64,
+and macOS x86_64.
 
 ## Architecture
 
@@ -17,12 +18,12 @@ program.
   `cmake/patches/srtla-portable-sockets.patch`, applied when the sources are
   fetched, routes its socket calls through `src/compat/srtla_platform.h`,
   which maps to Winsock plus [wepoll](https://github.com/piscisaureus/wepoll)
-  on Windows and to the native calls on Linux.
-- **libsrt.** On Linux, Haivision libsrt (release `v1.5.7`) is built from
-  source as a static library and linked into the plugin, together with static
-  OpenSSL `libcrypto` for SRT encryption support. Their symbols are kept
-  private to the plugin, so they do not clash with the system libsrt that OBS's
-  own FFmpeg may load into the same process. On Windows the plugin links
+  on Windows, `epoll` to kqueue on macOS, and to native calls on Linux.
+- **libsrt.** On Linux and macOS, Haivision libsrt (release `v1.5.7`) is built
+  from source as a static library and linked into the plugin, together with
+  static OpenSSL `libcrypto` for SRT encryption support. Linux linker options
+  keep these symbols private, so they do not clash with the system libsrt that
+  OBS's own FFmpeg may load into the same process. On Windows the plugin links
   against the `srt.dll` that OBS Studio itself ships (from obs-deps); DLLs
   have separate symbol namespaces, so no clash is possible there. libsrt
   messages appear in the OBS log with the prefix `[obs-srtla-source] libsrt:`.
@@ -126,6 +127,29 @@ plugin laid out like an OBS Studio directory (`obs-plugins\64bit\` and
 `data\obs-plugins\obs-srtla-source\`), which is what the installer packages.
 Debug symbols are an opt-in component: add `--component DebugSymbols`.
 
+## Build on macOS
+
+The release workflow builds the Intel x86_64 plugin with Xcode, using the OBS
+31 development environment provisioned by
+[obs-studio-devel-action](https://github.com/norihiro/obs-studio-devel-action),
+and OpenSSL 3 from Homebrew. A local build needs Xcode, CMake 3.28 or newer,
+Homebrew OpenSSL 3, and matching OBS/libobs and FFmpeg development files for
+OBS 31. Provide their CMake and pkg-config paths as needed:
+
+```sh
+brew install cmake pkg-config openssl@3
+cmake -S . -B build -G Xcode \
+  -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+  -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+  -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
+  -DCMAKE_PREFIX_PATH="<OBS development prefix>"
+cmake --build build --config Release --parallel
+```
+
+The plugin is produced as `obs-srtla-source.plugin`; its locale files are
+embedded in `Contents/Resources/locale`. The release ZIP also includes
+third-party notices in `Contents/Resources/licenses`.
+
 ### Install into OBS on Windows
 
 Run the installer. It requires administrator rights, refuses to continue while
@@ -187,8 +211,8 @@ Per-case logs are kept in `build_e2e/logs/`.
 ## Releases
 
 `.github/workflows/release.yml` builds every push and pull request to `main`
-for Linux x86_64, Linux arm64 and Windows x64, and runs the end-to-end tests
-on Linux x86_64.
+for Linux x86_64, Linux arm64, Windows x64 and macOS x86_64, and runs the
+end-to-end tests on Linux x86_64.
 
 Releases are versioned with
 [github-tag-action](https://github.com/anothrNick/github-tag-action). A push
@@ -211,6 +235,8 @@ release with generated notes and these assets:
 - `obs-srtla-source-windows-x64-<version>-installer.exe`: NSIS installer.
 - `obs-srtla-source-windows-x64-<version>.zip`: the same files laid out like
   the OBS Studio folder (`obs-plugins\64bit\`, `data\obs-plugins\`).
+- `obs-srtla-source-macos-x86_64-<version>.zip`: the Intel macOS
+  `obs-srtla-source.plugin` bundle, with locales and license notices included.
 - `SHA256SUMS.txt`.
 
 The tag is pushed before the builds run, so if a build fails the tag remains
@@ -238,6 +264,21 @@ and falls back to English for any missing text.
 Close and restart OBS after installing or updating the plugin. To remove this
 user-local installation, close OBS and remove
 `~/.config/obs-studio/plugins/obs-srtla-source`.
+
+## Install into OBS on macOS
+
+The release package is x86_64; OBS must be able to load Intel plugins (on
+Apple silicon, run an Intel OBS build under Rosetta). Extract the bundle into
+the per-user OBS plugin directory:
+
+```sh
+mkdir -p "$HOME/Library/Application Support/obs-studio/plugins"
+unzip -o "obs-srtla-source-macos-x86_64-<version>.zip" \
+  -d "$HOME/Library/Application Support/obs-studio/plugins"
+```
+
+Restart OBS after installing or updating. To remove the plugin, close OBS and
+remove `~/Library/Application Support/obs-studio/plugins/obs-srtla-source.plugin`.
 
 ## Check that the plugin loaded
 
