@@ -45,7 +45,7 @@ libobs, FFmpeg 5.1 or newer (`libavformat`, `libavcodec`, `libavutil`,
 
 ## Build on Linux
 
-On Ubuntu or Pop!_OS, run the setup script. It installs the compiler, CMake,
+On Ubuntu or Pop!\_OS, run the setup script. It installs the compiler, CMake,
 Ninja, git and the OBS, FFmpeg and OpenSSL development packages, then builds
 the plugin:
 
@@ -139,9 +139,9 @@ OBS. It installs:
 - `<OBS>\data\obs-plugins\obs-srtla-source\licenses\*.txt` (third-party
   license notices) and the uninstaller.
 
-It registers under *Apps & features* as "OBS SRTLA Source (OBS Studio
+It registers under _Apps & features_ as "OBS SRTLA Source (OBS Studio
 plugin)"; `/S` performs a silent install (`/D=<OBS dir>` overrides the
-folder). To remove the plugin use *Apps & features* or run the uninstaller in
+folder). To remove the plugin use _Apps & features_ or run the uninstaller in
 the plugin data folder.
 
 Without the installer, `.\scripts\build-windows.ps1 -InstallToObs` (from an
@@ -283,7 +283,7 @@ With obs-websocket 5 loaded (included in OBS 28+), the plugin registers the
   "requestData": {
     "vendorName": "obs-srtla-source",
     "requestType": "GetSrtStats",
-    "requestData": {"sourceName": "SRTLA Source"}
+    "requestData": { "sourceName": "SRTLA Source" }
   }
 }
 ```
@@ -387,3 +387,5 @@ distributing it, include their license notices and make the libsrt source for
 the embedded release available. `cmake --install` and the Windows installer
 place the srtla, spdlog, libsrt and (Windows) wepoll license texts in the
 plugin's data directory under `licenses/`.
+
+test
