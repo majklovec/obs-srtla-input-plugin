@@ -1,6 +1,7 @@
-#include <arpa/inet.h>
 #include <obs-module.h>
 #include <util/platform.h>
+
+#include <srtla_platform.h>
 
 #include "plugin-log.hpp"
 #include "srtla-receiver.hpp"
@@ -15,7 +16,8 @@ extern "C" {
 }
 #include <srt/access_control.h>
 #include <srt/srt.h>
-// libsrt pulls in <syslog.h>, whose LOG_* macros shadow OBS's log levels.
+// libsrt pulls in <syslog.h> (or its Windows stand-in), whose LOG_* macros
+// shadow OBS's log levels.
 #undef LOG_ERROR
 #undef LOG_WARNING
 #undef LOG_INFO
@@ -805,18 +807,23 @@ void source_defaults(obs_data_t* settings) {
     obs_data_set_default_string(settings, setting_streamid, "");
 }
 
-obs_source_info source_info = {
-    .id = "srtla_source",
-    .type = OBS_SOURCE_TYPE_INPUT,
-    .output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_AUDIO,
-    .get_name = source_get_name,
-    .create = source_create,
-    .destroy = source_destroy,
-    .get_defaults = source_defaults,
-    .get_properties = source_properties,
-    .update = source_update,
-    .icon_type = OBS_ICON_TYPE_CAMERA,
-};
+// Designated initializers are C++20; MSVC rejects them in C++17 mode.
+obs_source_info make_source_info() {
+    obs_source_info info{};
+    info.id = "srtla_source";
+    info.type = OBS_SOURCE_TYPE_INPUT;
+    info.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_AUDIO;
+    info.get_name = source_get_name;
+    info.create = source_create;
+    info.destroy = source_destroy;
+    info.get_defaults = source_defaults;
+    info.get_properties = source_properties;
+    info.update = source_update;
+    info.icon_type = OBS_ICON_TYPE_CAMERA;
+    return info;
+}
+
+obs_source_info source_info = make_source_info();
 
 }  // namespace
 

@@ -1,0 +1,617 @@
+diff --git a/src/common.c b/src/common.c
+index 803a329..66347de 100644
+--- a/src/common.c
++++ b/src/common.c
+@@ -19,12 +19,8 @@
+     along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+ 
+-#include <arpa/inet.h>
+-#include <endian.h>
+-#include <netinet/in.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <sys/socket.h>
+ #include <time.h>
+ 
+ #include "common.h"
+@@ -74,7 +70,7 @@ int parse_port(char *port_str) {
+ 
+ int get_seconds(time_t *s) {
+   struct timespec ts;
+-  int ret = clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
++  int ret = srtla_monotonic_time(&ts);
+   if (ret != 0)
+     return -1;
+   *s = ts.tv_sec;
+@@ -83,7 +79,7 @@ int get_seconds(time_t *s) {
+ 
+ int get_ms(uint64_t *ms) {
+   struct timespec ts;
+-  int ret = clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
++  int ret = srtla_monotonic_time(&ts);
+   if (ret != 0)
+     return -1;
+   *ms = ((uint64_t)(ts.tv_sec)) * 1000 + ((uint64_t)(ts.tv_nsec)) / 1000 / 1000;
+diff --git a/src/common.h b/src/common.h
+index a309f0a..dd76789 100644
+--- a/src/common.h
++++ b/src/common.h
+@@ -25,6 +25,15 @@
+ #include <stdint.h>
+ #include <time.h>
+ 
++#include <srtla_platform.h>
++
++#if defined(_MSC_VER) && !defined(__clang__)
++#define SRTLA_PACKED
++#pragma pack(push, 1)
++#else
++#define SRTLA_PACKED __attribute__((__packed__))
++#endif
++
+ #define MTU 1500
+ 
+ #define SRT_TYPE_HANDSHAKE 0x8000
+@@ -57,7 +66,7 @@
+ #define SEND_BUF_SIZE (100 * 1024 * 1024)
+ #define RECV_BUF_SIZE (100 * 1024 * 1024)
+ 
+-typedef struct __attribute__((__packed__)) {
++typedef struct SRTLA_PACKED {
+   uint16_t type;
+   uint16_t subtype;
+   uint32_t info;
+@@ -65,7 +74,7 @@ typedef struct __attribute__((__packed__)) {
+   uint32_t dest_id;
+ } srt_header_t;
+ 
+-typedef struct __attribute__((__packed__)) {
++typedef struct SRTLA_PACKED {
+   srt_header_t header;
+   uint32_t version;
+   uint16_t enc_field;
+@@ -80,7 +89,7 @@ typedef struct __attribute__((__packed__)) {
+ } srt_handshake_t;
+ 
+ // Extended KEEPALIVE Connection Info structure
+-typedef struct __attribute__((__packed__)) {
++typedef struct SRTLA_PACKED {
+   uint32_t conn_id;
+   int32_t window;
+   int32_t in_flight;
+@@ -89,6 +98,10 @@ typedef struct __attribute__((__packed__)) {
+   uint32_t bitrate_bytes_per_sec;
+ } connection_info_t;
+ 
++#if defined(_MSC_VER) && !defined(__clang__)
++#pragma pack(pop)
++#endif
++
+ int get_seconds(time_t *s);
+ int get_ms(uint64_t *ms);
+ 
+diff --git a/src/connection/connection.h b/src/connection/connection.h
+index e43394a..1f95d53 100644
+--- a/src/connection/connection.h
++++ b/src/connection/connection.h
+@@ -2,8 +2,8 @@
+ 
+ #include <array>
+ #include <memory>
+-#include <netinet/in.h>
+-#include <sys/socket.h>
++
++#include <srtla_platform.h>
+ 
+ #include "../receiver_config.h"
+ 
+diff --git a/src/connection/connection_group.cpp b/src/connection/connection_group.cpp
+index 820614d..ef370e0 100644
+--- a/src/connection/connection_group.cpp
++++ b/src/connection/connection_group.cpp
+@@ -5,7 +5,6 @@
+ #include <cstring>
+ #include <fstream>
+ #include <string>
+-#include <unistd.h>
+ 
+ #include <spdlog/spdlog.h>
+ 
+@@ -35,7 +34,7 @@ ConnectionGroup::~ConnectionGroup() {
+         if (epoll_fd_ >= 0) {
+             NetworkUtils::epoll_remove(epoll_fd_, srt_sock_);
+         }
+-        close(srt_sock_);
++        srtla_close_socket(srt_sock_);
+     }
+ }
+ 
+@@ -61,6 +60,11 @@ std::vector<struct sockaddr_storage> ConnectionGroup::get_client_addresses() con
+ }
+ 
+ void ConnectionGroup::write_socket_info_file() const {
++#ifdef _WIN32
++    // The info files live under /tmp for external tooling on the Linux
++    // receiver; there is no equivalent consumer on Windows.
++    return;
++#else
+     if (srt_sock_ == -1) {
+         return;
+     }
+@@ -80,9 +84,13 @@ void ConnectionGroup::write_socket_info_file() const {
+     }
+ 
+     spdlog::info("[Group: {}] Wrote SRTLA socket info file", static_cast<const void *>(this));
++#endif
+ }
+ 
+ void ConnectionGroup::remove_socket_info_file() const {
++#ifdef _WIN32
++    return;
++#else
+     if (srt_sock_ == -1) {
+         return;
+     }
+@@ -92,6 +100,7 @@ void ConnectionGroup::remove_socket_info_file() const {
+     std::remove(file_name.c_str());
+ 
+     spdlog::info("[Group: {}] Removed SRTLA socket info file", static_cast<const void *>(this));
++#endif
+ }
+ 
+ } // namespace srtla::connection
+diff --git a/src/protocol/pad_sendto.h b/src/protocol/pad_sendto.h
+index e12ae0f..b3b4f23 100644
+--- a/src/protocol/pad_sendto.h
++++ b/src/protocol/pad_sendto.h
+@@ -1,13 +1,13 @@
+ #pragma once
+ #include <cstring>
+-#include <sys/socket.h>
++#include <srtla_platform.h>
+ /* Pad small sendto() to 32 bytes to avoid carrier NAT drops on 2-byte packets */
+ static inline int pad_sendto(int sock, const void *buf, size_t len,
+                              int flags, const struct sockaddr *addr, socklen_t alen) {
+   unsigned char padded[32];
+-  if (len >= 32) return sendto(sock, buf, len, flags, addr, alen);
++  if (len >= 32) return srtla_sendto(sock, buf, (int)len, flags, addr, alen);
+   memset(padded, 0, 32);
+   memcpy(padded, buf, len);
+-  int ret = sendto(sock, padded, 32, flags, addr, alen);
++  int ret = srtla_sendto(sock, padded, 32, flags, addr, alen);
+   return (ret == 32) ? (int)len : ret;
+ }
+diff --git a/src/protocol/srt_handler.cpp b/src/protocol/srt_handler.cpp
+index 4b51e46..7f5ef18 100644
+--- a/src/protocol/srt_handler.cpp
++++ b/src/protocol/srt_handler.cpp
+@@ -4,17 +4,12 @@
+ #include "srt_handler.h"
+ #include "pad_sendto.h"
+ 
+-#include <arpa/inet.h>
+-
+ static inline int is_srt_handshake(const void *pkt, int n) {
+     if (n < 16) return 0;
+     const unsigned char *p = (const unsigned char *)pkt;
+     return (p[0] == 0x80) && (p[1] == 0x00);
+ }
+ #include <ctime>
+-#include <fcntl.h>
+-#include <sys/socket.h>
+-#include <unistd.h>
+ 
+ #include <spdlog/spdlog.h>
+ 
+@@ -40,7 +35,7 @@ void SRTHandler::handle_srt_data(connection::ConnectionGroupPtr group) {
+     }
+ 
+     char buf[MTU];
+-    int n = recv(group->srt_socket(), buf, MTU, 0);
++    int n = srtla_recv(group->srt_socket(), buf, MTU, 0);
+     if (n >= SRT_MIN_LEN) {
+         metrics::inc(metrics::SRT_PACKETS_RECEIVED);
+         metrics::inc(metrics::SRT_BYTES_RECEIVED, static_cast<uint64_t>(n));
+@@ -83,6 +78,27 @@ void SRTHandler::handle_srt_data(connection::ConnectionGroupPtr group) {
+             return;
+         }
+ 
++#ifdef _WIN32
++        // Winsock has no sendmmsg(); send to each connection individually.
++        size_t msg_count = 0;
++        int sent = 0;
++        for (const auto &conn : connections) {
++            if (msg_count >= static_cast<size_t>(MAX_CONNS_PER_GROUP)) {
++                break;
++            }
++            msg_count++;
++            if (srtla_sendto(srtla_socket_, buf, n, 0,
++                             reinterpret_cast<const struct sockaddr *>(&conn->address()),
++                             sizeof(struct sockaddr_storage)) == n) {
++                sent++;
++            }
++        }
++        if (static_cast<size_t>(sent) < msg_count) {
++            metrics::inc(metrics::SEND_ERR_DOWNSTREAM, msg_count - static_cast<size_t>(sent));
++            spdlog::warn("[Group: {}] sent only {}/{} messages: {}",
++                         static_cast<void *>(group.get()), sent, msg_count, srtla_socket_strerror());
++        }
++#else
+         // Use sendmmsg to send to all connections in a single syscall
+         struct mmsghdr msgs[MAX_CONNS_PER_GROUP];
+         struct iovec iovecs[MAX_CONNS_PER_GROUP];
+@@ -116,6 +132,7 @@ void SRTHandler::handle_srt_data(connection::ConnectionGroupPtr group) {
+             spdlog::warn("[Group: {}] sendmmsg sent only {}/{} messages",
+                          static_cast<void *>(group.get()), sent, msg_count);
+         }
++#endif
+     } else {
+         int ret = pad_sendto(srtla_socket_, &buf, n, 0,
+                          reinterpret_cast<const struct sockaddr *>(&group->last_address()), sizeof(struct sockaddr_storage));
+@@ -146,7 +163,7 @@ bool SRTHandler::forward_to_srt_server(connection::ConnectionGroupPtr group, con
+         return false;
+     }
+ 
+-    int ret = send(group->srt_socket(), buffer, length, 0);
++    int ret = srtla_send(group->srt_socket(), buffer, length, 0);
+     if (ret != length) {
+         metrics::inc(metrics::FORWARD_ERRORS);
+         spdlog::error("[Group: {}] Failed to forward SRTLA packet, terminating the group",
+@@ -164,7 +181,7 @@ bool SRTHandler::ensure_group_socket(connection::ConnectionGroupPtr group) {
+         return true;
+     }
+ 
+-    int sock = socket(srt_addr_.ss_family, SOCK_DGRAM | SOCK_NONBLOCK, 0);
++    int sock = static_cast<int>(socket(srt_addr_.ss_family, SOCK_DGRAM | SOCK_NONBLOCK, 0));
+     if (sock < 0) {
+         spdlog::error("[Group: {}] Failed to create an SRT socket", static_cast<void *>(group.get()));
+         remove_group(group);
+@@ -172,39 +189,38 @@ bool SRTHandler::ensure_group_socket(connection::ConnectionGroupPtr group) {
+     }
+ 
+     int bufsize = RECV_BUF_SIZE;
+-    if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize)) != 0) {
++    if (srtla_setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize)) != 0) {
+         spdlog::error("failed to set receive buffer size ({})", bufsize);
+-        close(sock);
++        srtla_close_socket(sock);
+         remove_group(group);
+         return false;
+     }
+ 
+     int sndbufsize = SEND_BUF_SIZE;
+-    if (setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbufsize, sizeof(sndbufsize)) != 0) {
++    if (srtla_setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbufsize, sizeof(sndbufsize)) != 0) {
+         spdlog::error("failed to set send buffer size ({})", sndbufsize);
+-        close(sock);
++        srtla_close_socket(sock);
+         remove_group(group);
+         return false;
+     }
+ 
+-    int flags = fcntl(sock, F_GETFL, 0);
+-    if (flags == -1 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) == -1) {
++    if (srtla_configure_udp_socket(sock) != 0) {
+         spdlog::error("failed to set g->srt_sock non-blocking");
+-        close(sock);
++        srtla_close_socket(sock);
+         remove_group(group);
+         return false;
+     }
+ 
+     int ret = -1;
+     if (srt_addr_.ss_family == AF_INET) {
+-        ret = connect(sock, reinterpret_cast<const struct sockaddr *>(&srt_addr_), sizeof(struct sockaddr_in));
++        ret = srtla_connect(sock, reinterpret_cast<const struct sockaddr *>(&srt_addr_), sizeof(struct sockaddr_in));
+     } else if (srt_addr_.ss_family == AF_INET6) {
+-        ret = connect(sock, reinterpret_cast<const struct sockaddr *>(&srt_addr_), sizeof(struct sockaddr_in6));
++        ret = srtla_connect(sock, reinterpret_cast<const struct sockaddr *>(&srt_addr_), sizeof(struct sockaddr_in6));
+     }
+ 
+     if (ret != 0) {
+-        spdlog::error("[Group: {}] Failed to connect to SRT server: {}", static_cast<void *>(group.get()), strerror(errno));
+-        close(sock);
++        spdlog::error("[Group: {}] Failed to connect to SRT server: {}", static_cast<void *>(group.get()), srtla_socket_strerror());
++        srtla_close_socket(sock);
+         remove_group(group);
+         return false;
+     }
+@@ -214,7 +230,7 @@ bool SRTHandler::ensure_group_socket(connection::ConnectionGroupPtr group) {
+ 
+     if (utils::NetworkUtils::epoll_add(epoll_fd_, sock, EPOLLIN, group.get()) != 0) {
+         spdlog::error("[Group: {}] Failed to add the SRT socket to the epoll", static_cast<void *>(group.get()));
+-        close(sock);
++        srtla_close_socket(sock);
+         remove_group(group);
+         return false;
+     }
+diff --git a/src/protocol/srt_handler.h b/src/protocol/srt_handler.h
+index c971497..cefa990 100644
+--- a/src/protocol/srt_handler.h
++++ b/src/protocol/srt_handler.h
+@@ -1,6 +1,6 @@
+ #pragma once
+ 
+-#include <sys/epoll.h>
++#include <srtla_platform.h>
+ 
+ #include "../connection/connection_registry.h"
+ #include "../metrics/prometheus.h"
+diff --git a/src/protocol/srtla_handler.cpp b/src/protocol/srtla_handler.cpp
+index 72d886f..f0c4afc 100644
+--- a/src/protocol/srtla_handler.cpp
++++ b/src/protocol/srtla_handler.cpp
+@@ -4,10 +4,8 @@
+ #include "srtla_handler.h"
+ #include "pad_sendto.h"
+ 
+-#include <arpa/inet.h>
+ #include <cmath>
+ #include <cstring>
+-#include <sys/socket.h>
+ 
+ #include <spdlog/spdlog.h>
+ 
+@@ -61,11 +59,32 @@ SRTLAHandler::SRTLAHandler(int srtla_socket,
+       rate_limiter_(rate_limiter) {}
+ 
+ int SRTLAHandler::process_packets(time_t ts) {
++    char bufs[RECV_BATCH_SIZE][MTU];
++    struct sockaddr_storage addrs[RECV_BATCH_SIZE];
++    int lens[RECV_BATCH_SIZE];
++    int num_msgs = 0;
++
++#ifdef _WIN32
++    // Winsock has no recvmmsg(); drain up to a batch of datagrams one by one.
++    while (num_msgs < RECV_BATCH_SIZE) {
++        socklen_t addr_len = kAddrLen;
++        int len = srtla_recvfrom(srtla_socket_, bufs[num_msgs], MTU, 0,
++                                 reinterpret_cast<struct sockaddr *>(&addrs[num_msgs]), &addr_len);
++        if (len < 0) {
++            if (num_msgs == 0 && !srtla_socket_would_block() && !srtla_socket_interrupted()) {
++                spdlog::error("Failed to read srtla packets: {}", srtla_socket_strerror());
++            }
++            break;
++        }
++        lens[num_msgs++] = len;
++    }
++    if (num_msgs == 0) {
++        return 0;
++    }
++#else
+     // Pre-allocate buffers for batch receive
+     struct iovec iovecs[RECV_BATCH_SIZE];
+     struct mmsghdr msgs[RECV_BATCH_SIZE];
+-    char bufs[RECV_BATCH_SIZE][MTU];
+-    struct sockaddr_storage addrs[RECV_BATCH_SIZE];
+ 
+     // Initialize message headers
+     for (int i = 0; i < RECV_BATCH_SIZE; i++) {
+@@ -81,19 +100,23 @@ int SRTLAHandler::process_packets(time_t ts) {
+     }
+ 
+     // Receive multiple packets in one syscall
+-    int num_msgs = recvmmsg(srtla_socket_, msgs, RECV_BATCH_SIZE, MSG_DONTWAIT, nullptr);
++    num_msgs = recvmmsg(srtla_socket_, msgs, RECV_BATCH_SIZE, MSG_DONTWAIT, nullptr);
+     if (num_msgs < 0) {
+         if (errno != EAGAIN && errno != EWOULDBLOCK) {
+             spdlog::error("Failed to read srtla packets: {}", strerror(errno));
+         }
+         return 0;
+     }
++    for (int i = 0; i < num_msgs; i++) {
++        lens[i] = static_cast<int>(msgs[i].msg_len);
++    }
++#endif
+ 
+     metrics::inc(metrics::RECV_BATCHES);
+ 
+     // Process each received packet
+     for (int i = 0; i < num_msgs; i++) {
+-        int len = static_cast<int>(msgs[i].msg_len);
++        int len = lens[i];
+         if (len > 0) {
+             metrics::inc(metrics::PACKETS_RECEIVED);
+             metrics::inc(metrics::BYTES_RECEIVED, static_cast<uint64_t>(len));
+diff --git a/src/utils/auth_rate_limiter.cpp b/src/utils/auth_rate_limiter.cpp
+index d1a91b1..72a1839 100644
+--- a/src/utils/auth_rate_limiter.cpp
++++ b/src/utils/auth_rate_limiter.cpp
+@@ -1,7 +1,5 @@
+ #include "auth_rate_limiter.h"
+ 
+-#include <netinet/in.h>
+-
+ #include <spdlog/spdlog.h>
+ 
+ #include "../metrics/prometheus.h"
+diff --git a/src/utils/auth_rate_limiter.h b/src/utils/auth_rate_limiter.h
+index d912368..f2f8307 100644
+--- a/src/utils/auth_rate_limiter.h
++++ b/src/utils/auth_rate_limiter.h
+@@ -4,7 +4,7 @@
+ #include <string>
+ #include <unordered_map>
+ 
+-#include <sys/socket.h>
++#include <srtla_platform.h>
+ 
+ namespace srtla::utils {
+ 
+diff --git a/src/utils/network_utils.cpp b/src/utils/network_utils.cpp
+index 8d49fdd..9709438 100644
+--- a/src/utils/network_utils.cpp
++++ b/src/utils/network_utils.cpp
+@@ -1,14 +1,8 @@
+ #include "network_utils.h"
+ 
+-#include <arpa/inet.h>
+ #include <cerrno>
+-#include <fcntl.h>
+-#include <netdb.h>
+-#include <sys/socket.h>
+-#include <unistd.h>
+ 
+ #include <cstring>
+-#include <fstream>
+ #include <stdexcept>
+ 
+ #include <spdlog/spdlog.h>
+@@ -23,19 +17,19 @@ int NetworkUtils::epoll_add(int epoll_fd, int socket_fd, uint32_t events, void *
+     struct epoll_event ev {};
+     ev.events = events;
+     ev.data.ptr = priv_data;
+-    return epoll_ctl(epoll_fd, EPOLL_CTL_ADD, socket_fd, &ev);
++    return srtla_epoll_ctl(epoll_fd, EPOLL_CTL_ADD, socket_fd, &ev);
+ }
+ 
+ int NetworkUtils::epoll_remove(int epoll_fd, int socket_fd) {
+     struct epoll_event ev {};
+-    return epoll_ctl(epoll_fd, EPOLL_CTL_DEL, socket_fd, &ev);
++    return srtla_epoll_ctl(epoll_fd, EPOLL_CTL_DEL, socket_fd, &ev);
+ }
+ 
+ uint16_t NetworkUtils::get_local_port(int socket_fd) {
+     struct sockaddr_storage local_addr {};
+     socklen_t len = sizeof(local_addr);
+-    if (getsockname(socket_fd, reinterpret_cast<struct sockaddr *>(&local_addr), &len) != 0) {
+-        spdlog::error("getsockname failed for socket {}: {}", socket_fd, strerror(errno));
++    if (srtla_getsockname(socket_fd, reinterpret_cast<struct sockaddr *>(&local_addr), &len) != 0) {
++        spdlog::error("getsockname failed for socket {}: {}", socket_fd, srtla_socket_strerror());
+         return 0;
+     }
+ 
+@@ -78,7 +72,7 @@ int found = -1;
+         spdlog::info("Trying to connect to SRT at {}:{}...", print_addr(addr->ai_addr), port);
+         
+         // Create socket with the appropriate family for this address
+-        tmp_sock = socket(addr->ai_family, SOCK_DGRAM, 0);
++        tmp_sock = static_cast<int>(socket(addr->ai_family, SOCK_DGRAM, 0));
+         if (tmp_sock < 0) {
+             spdlog::error("Failed to create a UDP socket for family {}", addr->ai_family);
+             continue;
+@@ -86,66 +80,70 @@ int found = -1;
+ 
+         // Set socket options
+         bool socket_opts_ok = true;
+-        if (setsockopt(tmp_sock, SOL_SOCKET, SO_RCVBUF, &recv_buf_size, sizeof(recv_buf_size)) != 0) {
++        if (srtla_setsockopt(tmp_sock, SOL_SOCKET, SO_RCVBUF, &recv_buf_size, sizeof(recv_buf_size)) != 0) {
+             spdlog::error("Failed to set a receive buffer size ({})", recv_buf_size);
+             socket_opts_ok = false;
+         }
+-        if (socket_opts_ok && setsockopt(tmp_sock, SOL_SOCKET, SO_SNDBUF, &send_buf_size, sizeof(send_buf_size)) != 0) {
++        if (socket_opts_ok && srtla_setsockopt(tmp_sock, SOL_SOCKET, SO_SNDBUF, &send_buf_size, sizeof(send_buf_size)) != 0) {
+             spdlog::error("Failed to set a send buffer size ({})", send_buf_size);
+             socket_opts_ok = false;
+         }
+         
+         // Set receive timeout to prevent indefinite blocking
+         if (socket_opts_ok) {
++#ifdef _WIN32
++            DWORD timeout = 2000;  // 2 seconds timeout, milliseconds on Winsock
++#else
+             struct timeval timeout;
+             timeout.tv_sec = 2;  // 2 seconds timeout
+             timeout.tv_usec = 0;
+-            if (setsockopt(tmp_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
++#endif
++            if (srtla_setsockopt(tmp_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
+                 spdlog::error("Failed to set receive timeout");
+                 socket_opts_ok = false;
+             }
+         }
+         
+         if (!socket_opts_ok) {
+-            close(tmp_sock);
++            srtla_close_socket(tmp_sock);
+             tmp_sock = -1;
+             continue;
+         }
+ 
+         // Connect to the address
+-        ret = connect(tmp_sock, addr->ai_addr, addr->ai_addrlen);
++        ret = srtla_connect(tmp_sock, addr->ai_addr, static_cast<socklen_t>(addr->ai_addrlen));
+         if (ret != 0) {
+             spdlog::info("Connection failed");
+-            close(tmp_sock);
++            srtla_close_socket(tmp_sock);
+             tmp_sock = -1;
+             continue;
+         }
+ 
+         // Send handshake packet
+-        ret = send(tmp_sock, &hs_packet, sizeof(hs_packet), 0);
++        ret = srtla_send(tmp_sock, &hs_packet, sizeof(hs_packet), 0);
+         if (ret != sizeof(hs_packet)) {
+             spdlog::info("Failed to send handshake packet");
+-            close(tmp_sock);
++            srtla_close_socket(tmp_sock);
+             tmp_sock = -1;
+             continue;
+         }
+ 
+         // Receive response
+         char buffer[MTU];
+-        ret = recv(tmp_sock, &buffer, MTU, 0);
++        ret = srtla_recv(tmp_sock, &buffer, MTU, 0);
+         if (ret == sizeof(hs_packet)) {
+             std::memcpy(out_addr, addr->ai_addr, addr->ai_addrlen);
+             spdlog::info("Success");
+             found = 1;
+         } else {
+             spdlog::info("Failed to receive handshake response");
+-            close(tmp_sock);
++            srtla_close_socket(tmp_sock);
+             tmp_sock = -1;
+         }
+     }
+ 
+     if (tmp_sock != -1) {
+-        close(tmp_sock);
++        srtla_close_socket(tmp_sock);
+     }
+ 
+     if (found == -1 && srt_addrs != nullptr) {
+@@ -174,21 +172,9 @@ int NetworkUtils::constant_time_compare(const void *a, const void *b, int length
+ }
+ 
+ void NetworkUtils::get_random_bytes(char *buffer, size_t size) {
+-    std::ifstream random("/dev/urandom", std::ios::in | std::ios::binary);
+-    if (!random.is_open()) {
+-        spdlog::error("Failed to open /dev/urandom");
+-        throw std::runtime_error("Failed to open /dev/urandom");
+-    }
+-
+-    size_t total_read = 0;
+-    while (total_read < size) {
+-        random.read(buffer + total_read, static_cast<std::streamsize>(size - total_read));
+-        std::streamsize bytes_read = random.gcount();
+-        if (bytes_read <= 0) {
+-            spdlog::error("Failed to read from /dev/urandom: got {} of {} bytes", total_read, size);
+-            throw std::runtime_error("Failed to read random bytes from /dev/urandom");
+-        }
+-        total_read += static_cast<size_t>(bytes_read);
++    if (srtla_random_bytes(buffer, size) != 0) {
++        spdlog::error("Failed to read {} random bytes from the system RNG", size);
++        throw std::runtime_error("Failed to read random bytes from the system RNG");
+     }
+ }
+ 
+diff --git a/src/utils/network_utils.h b/src/utils/network_utils.h
+index 2f8b19a..8039552 100644
+--- a/src/utils/network_utils.h
++++ b/src/utils/network_utils.h
+@@ -1,10 +1,9 @@
+ #pragma once
+ 
+ #include <cstdint>
+-#include <netinet/in.h>
+ #include <string>
+-#include <sys/epoll.h>
+-#include <sys/socket.h>
++
++#include <srtla_platform.h>
+ 
+ namespace srtla::utils {
+ 

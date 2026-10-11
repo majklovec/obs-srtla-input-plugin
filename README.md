@@ -1,7 +1,7 @@
 # OBS SRTLA Source
 
 An OBS input source that receives bonded SRTLA streams and outputs decoded
-video and audio to OBS.
+video and audio to OBS. It builds for Linux and Windows (x64).
 
 ## Architecture
 
@@ -13,12 +13,19 @@ program.
   `b8359bc`) is compiled into the plugin as a static library, together with
   header-only spdlog. Its event loop runs on a plugin thread, and its log
   output goes to the OBS log with the prefix `[obs-srtla-source] srtla:`.
-- **Embedded libsrt.** Haivision libsrt (release `v1.5.7`) is built from
+  Upstream targets Linux (BSD sockets, `epoll`, `recvmmsg`); the patch in
+  `cmake/patches/srtla-portable-sockets.patch`, applied when the sources are
+  fetched, routes its socket calls through `src/compat/srtla_platform.h`,
+  which maps to Winsock plus [wepoll](https://github.com/piscisaureus/wepoll)
+  on Windows and to the native calls on Linux.
+- **libsrt.** On Linux, Haivision libsrt (release `v1.5.7`) is built from
   source as a static library and linked into the plugin, together with static
   OpenSSL `libcrypto` for SRT encryption support. Their symbols are kept
   private to the plugin, so they do not clash with the system libsrt that OBS's
-  own FFmpeg may load into the same process. libsrt messages appear in the OBS
-  log with the prefix `[obs-srtla-source] libsrt:`.
+  own FFmpeg may load into the same process. On Windows the plugin links
+  against the `srt.dll` that OBS Studio itself ships (from obs-deps); DLLs
+  have separate symbol namespaces, so no clash is possible there. libsrt
+  messages appear in the OBS log with the prefix `[obs-srtla-source] libsrt:`.
 - **SRT + decode pipeline.** Each source opens a libsrt listener on an
   ephemeral loopback port. The embedded receiver accepts the bonded SRTLA
   links on the configured UDP port and forwards the reassembled SRT traffic
@@ -31,14 +38,12 @@ program.
   with swscale, and other audio layouts are downmixed to stereo with
   swresample.
 
-The upstream receiver uses epoll, so the plugin is Linux-only.
-
 At runtime the plugin needs only libraries that OBS itself already provides:
 libobs, FFmpeg 5.1 or newer (`libavformat`, `libavcodec`, `libavutil`,
-`libswresample` and `libswscale`), and the C/C++ runtime. It does not need a system libsrt,
-libssl/libcrypto, or `srtla_rec`.
+`libswresample` and `libswscale`), the C/C++ runtime and, on Windows, OBS's
+`srt.dll`. It does not need a system libsrt, libssl/libcrypto, or `srtla_rec`.
 
-## Build
+## Build on Linux
 
 On Ubuntu or Pop!_OS, run the setup script. It installs the compiler, CMake,
 Ninja, git and the OBS, FFmpeg and OpenSSL development packages, then builds
@@ -75,6 +80,76 @@ The preset builds in `Release` mode and strips the module after linking, so
 the output is a production binary of about 6 MB with no debug info. To keep
 debug symbols, configure with `-DSTRIP_PLUGIN=OFF`, or use a
 `RelWithDebInfo` build, which is never stripped.
+
+## Build on Windows
+
+Prerequisites (64-bit Windows 10/11):
+
+- Visual Studio 2022 or the Build Tools for Visual Studio 2022 with the
+  **Desktop development with C++** workload (MSVC v143 and a Windows 10 SDK
+  10.0.20348 or newer).
+- CMake 3.28 or newer (`winget install Kitware.CMake`; the copy bundled with
+  Visual Studio is also picked up).
+- Git (`winget install Git.Git`).
+- NSIS 3 for the installer (`winget install NSIS.NSIS`).
+
+Then, from a PowerShell prompt in the repository:
+
+```powershell
+.\scripts\build-windows.ps1 -Installer
+```
+
+The script checks the prerequisites, runs `cmake --preset windows-x64`,
+builds the `Release` configuration and the `installer` target. The first
+configure downloads into `.deps\` the pre-built OBS dependencies (obs-deps,
+which provide FFmpeg and libsrt), the Qt package the OBS build system
+expects, and the OBS Studio sources listed in `buildspec.json`, and builds
+libobs from them (SHA-256 checked; a few hundred MB and a few minutes, once).
+The SRTLA, spdlog and wepoll sources are fetched with Git as on Linux.
+
+Outputs:
+
+- `build_x64\Release\obs-srtla-source.dll` — the plugin module.
+- `release\obs-srtla-source-<version>-windows-x64-installer.exe` — the NSIS
+  installer (with `-Installer`).
+
+The same steps without the script:
+
+```powershell
+cmake --preset windows-x64
+cmake --build --preset windows-x64
+cmake --build build_x64 --config Release --target installer
+```
+
+`cmake --install build_x64 --config Release --prefix <dir>` stages the
+plugin laid out like an OBS Studio directory (`obs-plugins\64bit\` and
+`data\obs-plugins\obs-srtla-source\`), which is what the installer packages.
+Debug symbols are an opt-in component: add `--component DebugSymbols`.
+
+### Install into OBS on Windows
+
+Run the installer. It requires administrator rights, refuses to continue while
+`obs64.exe` is running, and proposes the OBS Studio folder recorded in the
+registry by the OBS installer (default `C:\Program Files\obs-studio`); any
+folder containing `bin\64bit\obs64.exe` can be selected, including a portable
+OBS. It installs:
+
+- `<OBS>\obs-plugins\64bit\obs-srtla-source.dll`
+- `<OBS>\data\obs-plugins\obs-srtla-source\locale\en-US.ini`
+- `<OBS>\data\obs-plugins\obs-srtla-source\licenses\*.txt` (third-party
+  license notices) and the uninstaller.
+
+It registers under *Apps & features* as "OBS SRTLA Source (OBS Studio
+plugin)"; `/S` performs a silent install (`/D=<OBS dir>` overrides the
+folder). To remove the plugin use *Apps & features* or run the uninstaller in
+the plugin data folder.
+
+Without the installer, `.\scripts\build-windows.ps1 -InstallToObs` (from an
+elevated prompt, OBS closed) copies the build output into the OBS folder
+found in the registry, or into `-ObsDir <folder>`.
+
+The receiver listens on a UDP port; allow `obs64.exe` through the Windows
+firewall for inbound UDP on that port, or the SRTLA sender cannot reach it.
 
 ## Test
 
@@ -158,7 +233,10 @@ ldd build_x86_64/obs-srtla-source.so
 ```
 
 Every listed dependency should resolve to a library path rather than `not
-found`.
+found`. On Windows the module depends on `obs.dll`, the `av*-*.dll`/`sw*-*.dll`
+FFmpeg libraries and `srt.dll` from OBS's `bin\64bit` folder; the plugin must
+be built against the same OBS major version that loads it (`buildspec.json`
+pins the OBS sources used for libobs).
 
 ## WebSocket SRT statistics
 
@@ -267,8 +345,12 @@ and of the embedded SRTLA revision under AGPL-3.0 terms. The upstream license
 text is fetched with the sources at
 `build_x86_64/_deps/srtla-src/LICENSE`.
 
-The plugin also statically embeds Haivision libsrt (MPL-2.0, license at
-`build_x86_64/srt_external-prefix/src/srt_external/LICENSE`) and OpenSSL 3
-`libcrypto` (Apache-2.0). Both licenses are compatible with distributing the
-combined binary under AGPL-3.0. When distributing it, include their license
-notices and make the libsrt source for the embedded release available.
+On Linux the plugin also statically embeds Haivision libsrt (MPL-2.0, license
+at `build_x86_64/srt_external-prefix/src/srt_external/LICENSE`) and OpenSSL 3
+`libcrypto` (Apache-2.0). On Windows it statically embeds wepoll
+(BSD-2-Clause) and links dynamically to OBS's libsrt. All of these licenses
+are compatible with distributing the combined binary under AGPL-3.0. When
+distributing it, include their license notices and make the libsrt source for
+the embedded release available. `cmake --install` and the Windows installer
+place the srtla, spdlog, libsrt and (Windows) wepoll license texts in the
+plugin's data directory under `licenses/`.
