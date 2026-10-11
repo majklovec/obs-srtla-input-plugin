@@ -194,7 +194,6 @@ else()
 endif()
 
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
-    src/plugin-main.c
     src/srtla-source.cpp
     src/srtla-receiver.cpp
     src/srtla-websocket.cpp
