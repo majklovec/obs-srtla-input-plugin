@@ -184,6 +184,39 @@ and builds `srtla_send` at the pinned SRTLA revision, and generates the clips
 in `build_e2e/`, which later runs reuse. A full run takes about two minutes.
 Per-case logs are kept in `build_e2e/logs/`.
 
+## Releases
+
+`.github/workflows/release.yml` builds every push and pull request to `main`
+for Linux x86_64, Linux arm64 and Windows x64, and runs the end-to-end tests
+on Linux x86_64.
+
+Releases are versioned with
+[github-tag-action](https://github.com/anothrNick/github-tag-action). A push
+to `main` is released only if a commit message in it contains `#patch`,
+`#minor` or `#major`. The action then bumps the latest `vX.Y.Z` tag and
+pushes the new tag. Without a marker, nothing is tagged or released. The
+first release starts from `v0.0.0`, so `#minor` produces `v0.1.0`.
+
+```sh
+git commit -m "Add GetSrtStats vendor request #minor"
+```
+
+The workflow writes the tag's version into `buildspec.json` for the build, so
+the plugin and installer carry that version. It then publishes a GitHub
+release with generated notes and these assets:
+
+- `obs-srtla-source-linux-<arch>-<version>.tar.gz`: per-user plugin layout
+  (`obs-srtla-source/bin/64bit/*.so` and `obs-srtla-source/data/`). Extract it
+  into `~/.config/obs-studio/plugins/`.
+- `obs-srtla-source-windows-x64-<version>-installer.exe`: NSIS installer.
+- `obs-srtla-source-windows-x64-<version>.zip`: the same files laid out like
+  the OBS Studio folder (`obs-plugins\64bit\`, `data\obs-plugins\`).
+- `SHA256SUMS.txt`.
+
+The tag is pushed before the builds run, so if a build fails the tag remains
+without a release. Fix the problem, then push another commit with a release
+marker. Alternatively, delete the tag and re-run the workflow.
+
 ## Install into OBS on Linux
 
 These steps are for a native Linux OBS installation. Flatpak and Snap builds

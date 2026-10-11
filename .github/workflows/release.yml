@@ -1,0 +1,211 @@
+name: Release
+
+# Every push to main is built. A release is made only when a commit message
+# carries #patch, #minor or #major (github-tag-action, DEFAULT_BUMP none):
+# the action creates the vX.Y.Z tag, the plugin is built for every platform
+# with that version, and the packages are published as a GitHub release.
+# Pull requests are built (and tested) without tagging or releasing.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Never cancel a run that may already have pushed a release tag.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  version:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      new_tag: ${{ steps.tag.outputs.new_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: tag
+        uses: anothrNick/github-tag-action@1.71.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WITH_V: true
+          DEFAULT_BUMP: none
+          RELEASE_BRANCHES: main
+
+  build:
+    needs: version
+    # Pull requests skip the version job, so build regardless of its result there.
+    if: >-
+      always() &&
+      (github.event_name == 'pull_request' ||
+       (needs.version.result == 'success' && needs.version.outputs.new_tag != ''))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            platform: linux
+            artifact: obs-srtla-source-linux-x86_64
+            e2e: true
+          - name: Linux arm64
+            os: ubuntu-24.04-arm
+            platform: linux
+            artifact: obs-srtla-source-linux-arm64
+            e2e: false
+          - name: Windows x64
+            os: windows-2022
+            platform: windows
+            artifact: obs-srtla-source-windows-x64
+            e2e: false
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    env:
+      NEW_TAG: ${{ needs.version.outputs.new_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.new_tag || github.sha }}
+
+      # The .deps cache key uses the committed buildspec.json, so it is taken
+      # before the release version is written into that file.
+      - name: Cache OBS dependencies (Windows)
+        if: matrix.platform == 'windows'
+        uses: actions/cache@v4
+        with:
+          path: .deps
+          key: obs-deps-windows-x64-${{ hashFiles('buildspec.json', 'cmake/common/buildspec_common.cmake', 'cmake/windows/buildspec.cmake') }}
+
+      - name: Set the release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${NEW_TAG#v}"
+          if [[ -n "$version" ]]; then
+            # Only the top-level plugin version (two-space indent), not the
+            # dependency versions nested deeper in buildspec.json.
+            sed -i -E "s/^  \"version\": \"[^\"]*\"/  \"version\": \"$version\"/" buildspec.json
+          fi
+          version="$(sed -nE 's/^  "version": "([^"]*)".*/\1/p' buildspec.json)"
+          [[ -n "$version" ]] || { echo "No plugin version in buildspec.json" >&2; exit 1; }
+          echo "PLUGIN_VERSION=$version" >> "$GITHUB_ENV"
+          echo "Building version $version"
+
+      - name: Install build dependencies (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git ninja-build pkg-config libobs-dev \
+            libavformat-dev libavcodec-dev libavutil-dev libswresample-dev \
+            libswscale-dev libssl-dev
+
+      - name: Build (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+
+      - name: Test (Linux)
+        if: matrix.e2e
+        run: |
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ./test/e2e.sh build/obs-srtla-source.so
+
+      # Laid out as a per-user OBS plugin (see README, Install into OBS on Linux).
+      - name: Package (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          set -euo pipefail
+          cmake --install build --prefix staging
+          plugin=package/obs-srtla-source
+          mkdir -p "$plugin/bin/64bit" "$plugin/data"
+          cp build/obs-srtla-source.so "$plugin/bin/64bit/"
+          cp -r staging/share/obs/obs-plugins/obs-srtla-source/. "$plugin/data/"
+          archive="${{ matrix.artifact }}-$PLUGIN_VERSION.tar.gz"
+          tar -czf "$archive" -C package obs-srtla-source
+          tar -tzf "$archive"
+          tar -tzf "$archive" | grep -q 'bin/64bit/obs-srtla-source.so$'
+          tar -tzf "$archive" | grep -q 'data/locale/en-US.ini$'
+          mkdir -p dist && mv "$archive" dist/
+
+      - name: Install NSIS (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe")) {
+            choco install nsis -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'NSIS installation failed' }
+          }
+
+      - name: Build (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          cmake --preset windows-x64
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
+          cmake --build --preset windows-x64 --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+          if (-not (Test-Path build_x64\Release\obs-srtla-source.dll)) {
+            throw 'The build did not produce obs-srtla-source.dll'
+          }
+
+      # NSIS installer plus a ZIP laid out like the OBS Studio folder.
+      - name: Package (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          cmake --build build_x64 --config Release --target installer
+          if ($LASTEXITCODE -ne 0) { throw 'Installer build failed' }
+          cmake --install build_x64 --config Release --prefix staging
+          if ($LASTEXITCODE -ne 0) { throw 'Install staging failed' }
+          if (-not (Test-Path staging\obs-plugins\64bit\obs-srtla-source.dll)) {
+            throw 'The staged plugin is missing obs-srtla-source.dll'
+          }
+          if (-not (Test-Path staging\data\obs-plugins\obs-srtla-source\locale\en-US.ini)) {
+            throw 'The staged plugin is missing locale data'
+          }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $base = "${{ matrix.artifact }}-$env:PLUGIN_VERSION"
+          Compress-Archive -Path staging\* -DestinationPath "dist\$base.zip"
+          Move-Item "release\obs-srtla-source-$env:PLUGIN_VERSION-windows-x64-installer.exe" "dist\$base-installer.exe"
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [version, build]
+    if: needs.version.outputs.new_tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: obs-srtla-source-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.new_tag }}
+          files: artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
