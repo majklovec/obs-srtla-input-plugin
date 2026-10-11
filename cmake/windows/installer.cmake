@@ -8,7 +8,7 @@ include_guard(GLOBAL)
 
 find_program(MAKENSIS_EXECUTABLE
   NAMES makensis
-  HINTS "$ENV{ProgramFiles(x86)}/NSIS" "$ENV{ProgramFiles}/NSIS" "$ENV{ProgramW6432}/NSIS"
+  HINTS "$ENV{ProgramFiles\(x86\)}/NSIS" "$ENV{ProgramFiles}/NSIS" "$ENV{ProgramW6432}/NSIS"
         "$ENV{LOCALAPPDATA}/Programs/NSIS" "$ENV{ChocolateyInstall}/bin" "C:/Program Files (x86)/NSIS"
   DOC "NSIS compiler (makensis.exe) used by the installer target")
 
