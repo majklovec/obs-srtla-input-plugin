@@ -208,6 +208,8 @@ finish() {
 check_common() {
 	local clips=$1
 	check exit = 0
+	check websocket_failures = 0
+	check connected_queries '>=' 1
 	check color_matrix = 1
 	check video_frames '>=' $((clips * CLIP_SECONDS * FPS * 8 / 10))
 	# Source removal must not block the OBS UI thread (libsrt cleanup takes ~1 s).
@@ -312,6 +314,17 @@ if selected port-update-two-sources; then
 		"--initial-port $((BASE_PORT + 900)) --extra-source $((BASE_PORT + 901))" h264-aac-stereo
 	check_common 1
 	check update_ms '<=' 500
+	finish
+fi
+
+if selected websocket-unavailable; then
+	stream websocket-unavailable "$single_clip_seconds" "--websocket 0" h264-aac-stereo
+	check exit = 0
+	check websocket_failures = 0
+	check connected_queries = 0
+	check video_frames '>=' $((CLIP_SECONDS * FPS * 8 / 10))
+	check destroy_ms '<=' 500
+	check_log 'obs-websocket unavailable'
 	finish
 fi
 

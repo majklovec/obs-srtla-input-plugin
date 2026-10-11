@@ -8,6 +8,7 @@
 // usage: harness PLUGIN.so --port PORT --seconds N
 //                [--initial-port PORT] [--extra-source PORT]
 //                [--passphrase TEXT] [--pbkeylen N] [--streamid TEXT]
+//                [--websocket 0]
 //   --initial-port  create the source on this port, then switch it to --port
 //                   through update() (tests port changes)
 //   --extra-source  run a second, idle source on this port at the same time
@@ -29,6 +30,84 @@
 namespace {
 
 obs_source_info plugin_source{};
+proc_handler_t* global_handler = nullptr;
+proc_handler_t* websocket_handler = nullptr;
+proc_handler_t* source_handlers[2]{};
+bool source_alive[2]{};
+struct WebsocketCallback {
+    void (*callback)(obs_data_t*, obs_data_t*, void*);
+    void* private_data;
+} websocket_callback{};
+unsigned websocket_failures = 0;
+unsigned connected_queries = 0;
+bool websocket_enabled = true;
+
+void require(bool condition, const char* message) {
+    if (!condition) {
+        std::fprintf(stderr, "WebSocket check failed: %s\n", message);
+        ++websocket_failures;
+    }
+}
+
+obs_data_t* query_stats(const char* name) {
+    obs_data_t* request = obs_data_create();
+    obs_data_t* response = obs_data_create();
+    obs_data_set_string(request, "sourceName", name);
+    websocket_callback.callback(request, response, websocket_callback.private_data);
+    obs_data_release(request);
+    return response;
+}
+
+void check_error(const char* name) {
+    obs_data_t* response = query_stats(name);
+    require(!obs_data_get_bool(response, "success") && *obs_data_get_string(response, "error"),
+            "invalid request must return an explicit error");
+    obs_data_release(response);
+}
+
+void poll_stats() {
+    obs_data_t* response = query_stats("SRTLA Test");
+    require(obs_data_get_bool(response, "success"), "source query must succeed");
+    require(std::strcmp(obs_data_get_string(response, "sourceName"), "SRTLA Test") == 0,
+            "source name must be returned");
+    obs_data_t* values = obs_data_get_obj(response, "stats");
+    if (obs_data_get_bool(response, "connected")) {
+        require(values && obs_data_has_user_value(values, "pktRecvTotal") &&
+                    obs_data_has_user_value(values, "byteRecvTotal") &&
+                    obs_data_has_user_value(values, "mbpsRecvRate") &&
+                    obs_data_has_user_value(values, "msRTT") &&
+                    obs_data_has_user_value(values, "pktRcvLossTotal") &&
+                    obs_data_has_user_value(values, "pktRcvRetrans") &&
+                    obs_data_has_user_value(values, "msRcvBuf"),
+                "connected source must return the SRT stats schema");
+        if (values) {
+            if (obs_data_get_int(values, "pktRecvTotal") > 0 && obs_data_get_int(values, "byteRecvTotal") > 0)
+                ++connected_queries;
+            obs_data_t* second = query_stats("SRTLA Test");
+            obs_data_t* second_values = obs_data_get_obj(second, "stats");
+            if (second_values && obs_data_get_int(second_values, "msTimeStamp") >=
+                                     obs_data_get_int(values, "msTimeStamp"))
+                require(obs_data_get_int(second_values, "pktRecvTotal") >=
+                            obs_data_get_int(values, "pktRecvTotal"),
+                        "queries must not reset receive counters");
+            obs_data_release(second_values);
+            obs_data_release(second);
+        }
+    } else {
+        require(!values, "disconnected source must not expose stale stats");
+    }
+    obs_data_release(values);
+    require(!obs_data_has_user_value(response, "srt_passphrase") &&
+                !obs_data_has_user_value(response, "srt_streamid"),
+            "response must not expose source secrets");
+    obs_data_release(response);
+    if (source_alive[1]) {
+        response = query_stats("Idle Test");
+        require(obs_data_get_bool(response, "success") && !obs_data_get_bool(response, "connected"),
+                "idle source stats must be isolated from the active source");
+        obs_data_release(response);
+    }
+}
 
 struct Stats {
     std::mutex mutex;
@@ -93,6 +172,34 @@ double elapsed_ms(std::chrono::steady_clock::time_point start) {
 // the plugin binds to these instead of the libobs implementations.
 extern "C" {
 
+proc_handler_t* obs_get_proc_handler(void) {
+    return global_handler;
+}
+
+proc_handler_t* obs_source_get_proc_handler(const obs_source_t* source) {
+    return source_handlers[source == reinterpret_cast<const obs_source_t*>(0x1) ? 0 : 1];
+}
+
+obs_source_t* obs_get_source_by_name(const char* name) {
+    if (source_alive[0] && std::strcmp(name, "SRTLA Test") == 0)
+        return reinterpret_cast<obs_source_t*>(0x1);
+    if (source_alive[1] && std::strcmp(name, "Idle Test") == 0)
+        return reinterpret_cast<obs_source_t*>(0x2);
+    if (std::strcmp(name, "Wrong Type") == 0)
+        return reinterpret_cast<obs_source_t*>(0x3);
+    return nullptr;
+}
+
+void obs_source_release(obs_source_t*) {}
+
+const char* obs_source_get_unversioned_id(const obs_source_t* source) {
+    return source == reinterpret_cast<const obs_source_t*>(0x3) ? "other_source" : "srtla_source";
+}
+
+const char* obs_source_get_name(const obs_source_t* source) {
+    return source == reinterpret_cast<const obs_source_t*>(0x1) ? "SRTLA Test" : "Idle Test";
+}
+
 void obs_register_source_s(const obs_source_info* info, size_t size) {
     std::memcpy(&plugin_source, info, size < sizeof(plugin_source) ? size : sizeof(plugin_source));
 }
@@ -141,14 +248,40 @@ int main(int argc, char** argv) {
             initial_port = value;
         else if (option == "--extra-source")
             extra_port = value;
+        else if (option == "--websocket")
+            websocket_enabled = value != 0;
     }
     if (!plugin_path || port <= 0 || seconds <= 0) {
         std::fprintf(stderr,
                      "usage: %s PLUGIN.so --port PORT --seconds N [--initial-port PORT] [--extra-source PORT] "
-                     "[--passphrase TEXT] [--pbkeylen N] [--streamid TEXT]\n",
+                     "[--passphrase TEXT] [--pbkeylen N] [--streamid TEXT] [--websocket 0]\n",
                      argv[0]);
         return 2;
     }
+
+    global_handler = proc_handler_create();
+    websocket_handler = proc_handler_create();
+    source_handlers[0] = proc_handler_create();
+    source_handlers[1] = proc_handler_create();
+    if (websocket_enabled)
+        proc_handler_add(global_handler, "void obs_websocket_api_get_ph(out ptr ph)",
+                         [](void*, calldata_t* data) { calldata_set_ptr(data, "ph", websocket_handler); }, nullptr);
+    proc_handler_add(websocket_handler, "void vendor_register(string name, out ptr vendor)",
+                     [](void*, calldata_t* data) {
+                         require(std::strcmp(calldata_string(data, "name"), "obs-srtla-source") == 0,
+                                 "vendor name");
+                         calldata_set_ptr(data, "vendor", websocket_handler);
+                     }, nullptr);
+    proc_handler_add(websocket_handler,
+                     "void vendor_request_register(ptr vendor, string type, ptr callback, out bool success)",
+                     [](void*, calldata_t* data) {
+                         require(std::strcmp(calldata_string(data, "type"), "GetSrtStats") == 0,
+                                 "request type");
+                         websocket_callback = *static_cast<WebsocketCallback*>(calldata_ptr(data, "callback"));
+                         calldata_set_bool(data, "success", true);
+                     }, nullptr);
+    proc_handler_add(websocket_handler, "void vendor_request_unregister(ptr vendor, string type)",
+                     [](void*, calldata_t*) { websocket_callback = {}; }, nullptr);
 
     void* module = dlopen(plugin_path, RTLD_NOW | RTLD_LOCAL);
     if (!module) {
@@ -157,9 +290,19 @@ int main(int argc, char** argv) {
     }
     auto module_load = reinterpret_cast<bool (*)()>(dlsym(module, "obs_module_load"));
     auto module_unload = reinterpret_cast<void (*)()>(dlsym(module, "obs_module_unload"));
+    auto module_post_load = reinterpret_cast<void (*)()>(dlsym(module, "obs_module_post_load"));
     if (!module_load || !module_load() || !plugin_source.create) {
         std::fprintf(stderr, "plugin did not load or register a source\n");
         return 1;
+    }
+    require(module_post_load != nullptr, "module must register requests after all plugins load");
+    if (module_post_load)
+        module_post_load();
+    require((websocket_callback.callback != nullptr) == websocket_enabled, "optional WebSocket registration");
+    if (websocket_callback.callback) {
+        check_error("");
+        check_error("Missing Source");
+        check_error("Wrong Type");
     }
 
     obs_data_t* settings = obs_data_create();
@@ -173,12 +316,14 @@ int main(int argc, char** argv) {
     if (pbkeylen >= 0)
         obs_data_set_int(settings, "srt_pbkeylen", pbkeylen);
     void* source = plugin_source.create(settings, reinterpret_cast<obs_source_t*>(0x1));
+    source_alive[0] = true;
 
     void* extra_source = nullptr;
     if (extra_port) {
         obs_data_t* extra_settings = obs_data_create();
         obs_data_set_int(extra_settings, "srtla_port", extra_port);
         extra_source = plugin_source.create(extra_settings, reinterpret_cast<obs_source_t*>(0x2));
+        source_alive[1] = true;
         obs_data_release(extra_settings);
     }
 
@@ -191,16 +336,28 @@ int main(int argc, char** argv) {
         update_ms = elapsed_ms(start);
     }
 
-    std::this_thread::sleep_for(std::chrono::seconds(seconds));
+    for (int i = 0; i < seconds * 20; ++i) {
+        if (websocket_callback.callback)
+            poll_stats();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
 
     const auto start = std::chrono::steady_clock::now();
     plugin_source.destroy(source);
     if (extra_source)
         plugin_source.destroy(extra_source);
     const double destroy_ms = elapsed_ms(start);
+    source_alive[0] = source_alive[1] = false;
+    if (websocket_callback.callback)
+        check_error("SRTLA Test");
     obs_data_release(settings);
     if (module_unload)
         module_unload();
+    require(!websocket_callback.callback, "request must be unregistered on module unload");
+    proc_handler_destroy(source_handlers[0]);
+    proc_handler_destroy(source_handlers[1]);
+    proc_handler_destroy(websocket_handler);
+    proc_handler_destroy(global_handler);
 
     rusage usage{};
     getrusage(RUSAGE_SELF, &usage);
@@ -208,13 +365,14 @@ int main(int argc, char** argv) {
     std::printf(
         "RESULT video_frames=%llu video_formats=%s size=%ux%u trc=%d color_matrix=%d "
         "video_span_ms=%.0f audio_packets=%llu audio_samples=%llu audio_formats=%s channels=%s "
-        "update_ms=%.0f destroy_ms=%.0f cpu_s=%.2f maxrss_kb=%ld\n",
+        "update_ms=%.0f destroy_ms=%.0f cpu_s=%.2f maxrss_kb=%ld "
+        "websocket_failures=%u connected_queries=%u\n",
         stats.video_frames, join(stats.video_formats).c_str(), stats.width, stats.height, stats.trc,
         stats.color_matrix_set ? 1 : 0, (stats.last_video_ts - stats.first_video_ts) / 1e6,
         stats.audio_packets, stats.audio_samples, join(stats.audio_formats).c_str(),
         join(stats.speakers).c_str(), update_ms, destroy_ms,
         usage.ru_utime.tv_sec + usage.ru_stime.tv_sec +
             (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6,
-        usage.ru_maxrss);
-    return 0;
+        usage.ru_maxrss, websocket_failures, connected_queries);
+    return websocket_failures ? 1 : 0;
 }

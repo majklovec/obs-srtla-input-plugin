@@ -4,6 +4,7 @@
 
 #include "plugin-log.hpp"
 #include "srtla-receiver.hpp"
+#include "srtla-websocket.hpp"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -602,7 +603,14 @@ std::string encryption_state(SRTSOCKET stream) {
 // SRT connections one at a time until the source is stopped.
 class SrtlaSource {
    public:
-    explicit SrtlaSource(obs_source_t* source) : source_(source) {}
+    explicit SrtlaSource(obs_source_t* source) : source_(source) {
+        proc_handler_add(obs_source_get_proc_handler(source_), "void get_srt_stats(ptr response)",
+                         [](void* opaque, calldata_t* data) {
+                             static_cast<SrtlaSource*>(opaque)->get_stats(
+                                 static_cast<obs_data_t*>(calldata_ptr(data, "response")));
+                         },
+                         this);
+    }
     ~SrtlaSource() { stop(); }
 
     SrtlaSource(const SrtlaSource&) = delete;
@@ -623,10 +631,61 @@ class SrtlaSource {
     }
 
    private:
+    void get_stats(obs_data_t* response) {
+        // Keep the socket alive throughout the query, including source updates.
+        std::lock_guard<std::mutex> lock(stream_mutex_);
+        const SRTSOCKET stream = stream_.load();
+        const bool connected = stream != SRT_INVALID_SOCK && srt_getsockstate(stream) == SRTS_CONNECTED;
+        obs_data_set_bool(response, "connected", connected);
+        if (!connected) {
+            obs_data_set_bool(response, "success", true);
+            return;
+        }
+        SRT_TRACEBSTATS stats{};
+        if (srt_bistats(stream, &stats, 0, 1) == SRT_ERROR) {
+            obs_data_set_bool(response, "success", false);
+            obs_data_set_string(response, "error", srt_getlasterror_str());
+            return;
+        }
+        obs_data_t* values = obs_data_create();
+        obs_data_set_int(values, "msTimeStamp", stats.msTimeStamp);
+        obs_data_set_int(values, "pktRecvTotal", stats.pktRecvTotal);
+        obs_data_set_int(values, "pktRecvUniqueTotal", stats.pktRecvUniqueTotal);
+        obs_data_set_int(values, "byteRecvTotal", stats.byteRecvTotal);
+        obs_data_set_int(values, "byteRecvUniqueTotal", stats.byteRecvUniqueTotal);
+        obs_data_set_int(values, "pktRcvLossTotal", stats.pktRcvLossTotal);
+        obs_data_set_int(values, "byteRcvLossTotal", stats.byteRcvLossTotal);
+        obs_data_set_int(values, "pktRcvDropTotal", stats.pktRcvDropTotal);
+        obs_data_set_int(values, "byteRcvDropTotal", stats.byteRcvDropTotal);
+        obs_data_set_int(values, "pktRcvUndecryptTotal", stats.pktRcvUndecryptTotal);
+        obs_data_set_int(values, "pktRcvRetrans", stats.pktRcvRetrans);
+        obs_data_set_int(values, "pktRcvBelated", stats.pktRcvBelated);
+        obs_data_set_int(values, "pktSentACKTotal", stats.pktSentACKTotal);
+        obs_data_set_int(values, "pktSentNAKTotal", stats.pktSentNAKTotal);
+        obs_data_set_double(values, "mbpsRecvRate", stats.mbpsRecvRate);
+        obs_data_set_double(values, "msRTT", stats.msRTT);
+        obs_data_set_double(values, "mbpsBandwidth", stats.mbpsBandwidth);
+        obs_data_set_int(values, "pktReorderDistance", stats.pktReorderDistance);
+        obs_data_set_int(values, "pktReorderTolerance", stats.pktReorderTolerance);
+        obs_data_set_int(values, "pktRcvBuf", stats.pktRcvBuf);
+        obs_data_set_int(values, "byteRcvBuf", stats.byteRcvBuf);
+        obs_data_set_int(values, "msRcvBuf", stats.msRcvBuf);
+        obs_data_set_int(values, "msRcvTsbPdDelay", stats.msRcvTsbPdDelay);
+        obs_data_set_int(values, "byteAvailRcvBuf", stats.byteAvailRcvBuf);
+        obs_data_set_obj(response, "stats", values);
+        obs_data_release(values);
+        obs_data_set_bool(response, "success", true);
+    }
+
+    void close_stream() {
+        std::lock_guard<std::mutex> lock(stream_mutex_);
+        close_socket(stream_);
+    }
+
     void stop() {
         stopping_ = true;
         // Closing the sockets unblocks accept/receive in the worker.
-        close_socket(stream_);
+        close_stream();
         close_socket(listener_);
         if (thread_.joinable())
             thread_.join();
@@ -635,7 +694,7 @@ class SrtlaSource {
     void run() {
         if (start_srt())
             serve();
-        close_socket(stream_);
+        close_stream();
         close_socket(listener_);
     }
 
@@ -672,14 +731,17 @@ class SrtlaSource {
                     plugin_log(LOG_WARNING, "SRT accept failed: %s", srt_getlasterror_str());
                 continue;
             }
-            stream_ = stream;
+            {
+                std::lock_guard<std::mutex> lock(stream_mutex_);
+                stream_ = stream;
+            }
             if (srt_setsockflag(stream, SRTO_RCVTIMEO, &srt_timeout_ms, sizeof(srt_timeout_ms)) == SRT_ERROR) {
-                close_socket(stream_);
+                close_stream();
                 continue;
             }
             plugin_log(LOG_INFO, "SRT stream connected (%s)", encryption_state(stream).c_str());
             MediaDecoder(source_).run(stream, stopping_);
-            close_socket(stream_);
+            close_stream();
             if (!stopping_)
                 plugin_log(LOG_INFO, "SRT stream ended");
         }
@@ -693,6 +755,7 @@ class SrtlaSource {
     std::atomic<bool> stopping_{false};
     std::atomic<SRTSOCKET> listener_{SRT_INVALID_SOCK};
     std::atomic<SRTSOCKET> stream_{SRT_INVALID_SOCK};
+    std::mutex stream_mutex_;
     std::thread thread_;
 };
 
@@ -767,7 +830,12 @@ bool obs_module_load(void) {
     return true;
 }
 
+void obs_module_post_load(void) {
+    srtla_websocket_initialize();
+}
+
 void obs_module_unload(void) {
+    srtla_websocket_shutdown();
     if (srt_started)
         srt_cleanup();
 }

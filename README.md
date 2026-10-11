@@ -97,6 +97,12 @@ stream, mismatched key lengths, wrong, missing and invalid passphrases, and
 a matching and a wrong stream ID. The suite also fails if update or
 destroy blocks for more than 500 ms.
 
+The harness also emulates the obs-websocket vendor API and polls `GetSrtStats`
+during streaming and reconnection. It checks registration/unregistration,
+invalid requests, the stats schema, non-resetting counters, disconnected
+responses, and isolation between sources. The `websocket-unavailable` case
+verifies playback without obs-websocket.
+
 The tests need `ffmpeg` with SRT, libx264 and libx265 support, plus the
 normal build tools. On the first run the script builds the harness, fetches
 and builds `srtla_send` at the pinned SRTLA revision, and generates the clips
@@ -153,6 +159,55 @@ ldd build_x86_64/obs-srtla-source.so
 
 Every listed dependency should resolve to a library path rather than `not
 found`.
+
+## WebSocket SRT statistics
+
+With obs-websocket 5 loaded (included in OBS 28+), the plugin registers the
+`obs-srtla-source` vendor and the read-only `GetSrtStats` request. Poll it using
+`CallVendorRequest`, supplying the OBS source name:
+
+```json
+{
+  "requestType": "CallVendorRequest",
+  "requestData": {
+    "vendorName": "obs-srtla-source",
+    "requestType": "GetSrtStats",
+    "requestData": {"sourceName": "SRTLA Source"}
+  }
+}
+```
+
+The vendor `responseData` contains `success`, `sourceName`, and `connected`.
+While connected it also includes a `stats` object with native libsrt field
+names:
+
+- Receive totals: `pktRecvTotal`, `pktRecvUniqueTotal`, `byteRecvTotal`,
+  `byteRecvUniqueTotal`.
+- Loss/drop totals: `pktRcvLossTotal`, `byteRcvLossTotal`, `pktRcvDropTotal`,
+  `byteRcvDropTotal`, `pktRcvUndecryptTotal`.
+- Retransmissions and late arrivals: `pktRcvRetrans`, `pktRcvBelated`.
+- Control packet totals: `pktSentACKTotal`, `pktSentNAKTotal`.
+- Rates: `mbpsRecvRate`, `mbpsBandwidth` (megabits/second), `msRTT`
+  (milliseconds), and `msTimeStamp` (connection age in milliseconds).
+- Reordering: `pktReorderDistance`, `pktReorderTolerance`.
+- Receive buffer: `pktRcvBuf`, `byteRcvBuf`, `msRcvBuf`,
+  `byteAvailRcvBuf`, and negotiated receive latency `msRcvTsbPdDelay`.
+
+Queries never clear SRT statistics: counters (including `pktRcvRetrans` and
+`pktRcvBelated`) and `mbpsRecvRate` cover the current connection since it
+started. To calculate a recent bitrate, take the difference between byte
+counters over your polling interval. Buffer values and RTT are instantaneous.
+Counters restart when the sender reconnects or the source settings change.
+SRT loss counts include recoverable gaps; drop counts describe packets that
+missed their delivery deadline. These are SRT connection statistics after
+the SRTLA relay, not per-link bonding metrics.
+
+An idle or disconnected source returns `success: true, connected: false`
+without a `stats` object. Invalid names, wrong source types, and SRT query
+failures return `success: false` with an `error` string inside the vendor
+response; clients should check it even if `CallVendorRequest` itself succeeds.
+No passphrase or stream ID is exposed. Without obs-websocket the source
+continues to work normally; only the vendor request is disabled.
 
 ## Source settings
 

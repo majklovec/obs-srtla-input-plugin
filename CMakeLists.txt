@@ -134,6 +134,7 @@ target_link_options(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     src/srtla-source.cpp
     src/srtla-receiver.cpp
+    src/srtla-websocket.cpp
 )
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
