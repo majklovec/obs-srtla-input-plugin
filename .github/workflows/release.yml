@@ -58,7 +58,7 @@ jobs:
                       platform: linux
                       artifact: obs-srtla-source-linux-x86_64
                       e2e: true
-                    - name: Linux x86_64
+                    - name: Linux x86_64_26.04
                       os: ubuntu-26.04
                       platform: linux
                       artifact: obs-srtla-source-linux-26.04-x86_64
