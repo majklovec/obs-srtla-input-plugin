@@ -170,11 +170,15 @@ set_target_properties(srtla_embedded PROPERTIES
 
 if(NOT OS_WINDOWS)
     # libsrt is built from pinned sources as a static PIC library and linked into
-    # the plugin together with static OpenSSL libcrypto (SRT encryption), so the
-    # plugin does not depend on a system libsrt.
+    # the plugin (SRT encryption) against the system shared OpenSSL libcrypto, so
+    # the plugin does not depend on a system libsrt. The final link uses the
+    # shared libcrypto: the static libcrypto on newer distros (e.g. OpenSSL 3.5
+    # on Ubuntu 26.04) records a dependency on a separate libjitterentropy.a that
+    # is not shipped as a package, which would break the plugin link. SRT itself
+    # is still built with static OpenSSL via its own ExternalProject args below.
     include(ExternalProject)
     set(SRT_GIT_TAG "v1.5.7" CACHE STRING "Haivision libsrt release to embed")
-    set(OPENSSL_USE_STATIC_LIBS TRUE)
+    set(OPENSSL_USE_STATIC_LIBS FALSE)
     find_package(OpenSSL 3 REQUIRED COMPONENTS Crypto)
 
     set(SRT_PREFIX "${CMAKE_BINARY_DIR}/srt-install")
