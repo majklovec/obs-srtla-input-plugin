@@ -34,6 +34,43 @@ if(OS_WINDOWS)
     # FFmpeg and libsrt come from the obs-deps package that OBS itself ships.
     include(dependencies)
     set(PLUGIN_SRT_TARGET Libsrt::Libsrt)
+elseif(OS_MACOS)
+    # The OBS 31 macOS deps ship FFmpeg as plain dylibs in <deps>/lib with
+    # headers under <deps>/include and no pkg-config files, so locate the deps
+    # root from CMAKE_FRAMEWORK_PATH (set by the obs-studio-devel action).
+    foreach(entry IN LISTS CMAKE_FRAMEWORK_PATH)
+        if(EXISTS "${entry}/lib/libavformat.dylib")
+            set(FFMPEG_DEPS_ROOT "${entry}")
+            break()
+        endif()
+    endforeach()
+    if(NOT FFMPEG_DEPS_ROOT)
+        message(FATAL_ERROR "FFmpeg dylibs not found; add the obs-deps directory to CMAKE_FRAMEWORK_PATH")
+    endif()
+
+    # Link the unversioned dylibs: their install name is @rpath/lib<name>.dylib,
+    # matching how OBS ships them, so the recorded dependency resolves at runtime.
+    set(PLUGIN_FFMPEG_TARGETS "")
+    foreach(component IN ITEMS avformat avcodec avutil swresample swscale)
+        set(_lib "${FFMPEG_DEPS_ROOT}/lib/lib${component}.dylib")
+        if(NOT EXISTS "${_lib}")
+            message(FATAL_ERROR "Missing FFmpeg library ${_lib} in the obs-deps directory")
+        endif()
+        set(_target FFmpeg::${component})
+        if(NOT TARGET ${_target})
+            add_library(${_target} UNKNOWN IMPORTED)
+            set_target_properties(${_target} PROPERTIES
+                IMPORTED_LOCATION "${_lib}"
+                INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_DEPS_ROOT}/include")
+        endif()
+        list(APPEND PLUGIN_FFMPEG_TARGETS ${_target})
+    endforeach()
+
+    file(READ "${FFMPEG_DEPS_ROOT}/include/libavformat/version_major.h" _avformat_version_header)
+    string(REGEX MATCH "LIBAVFORMAT_VERSION_MAJOR[ \t]+([0-9]+)" _match "${_avformat_version_header}")
+    if(CMAKE_MATCH_1 LESS 59)
+        message(FATAL_ERROR "libavformat >= 59 is required, found major version ${CMAKE_MATCH_1}")
+    endif()
 else()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET

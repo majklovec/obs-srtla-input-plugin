@@ -482,6 +482,15 @@ index 8d49fdd..9709438 100644
          return 0;
      }
  
+@@ -67,7 +61,7 @@ int NetworkUtils::resolve_srt_address(const char *host,
+     struct addrinfo *srt_addrs = nullptr;
+     int ret = getaddrinfo(host, port, &hints, &srt_addrs);
+     if (ret != 0) {
+-        spdlog::error("Failed to resolve the address: {}:{}: {}", host, port, gai_strerror(ret));
++        spdlog::error("Failed to resolve the address: {}:{}: {}", host, port, srtla_gai_strerror(ret));
+         return -1;
+     }
+ 
 @@ -78,7 +72,7 @@ int found = -1;
          spdlog::info("Trying to connect to SRT at {}:{}...", print_addr(addr->ai_addr), port);
          
