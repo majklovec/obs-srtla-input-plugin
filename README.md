@@ -208,6 +208,20 @@ and builds `srtla_send` at the pinned SRTLA revision, and generates the clips
 in `build_e2e/`, which later runs reuse. A full run takes about two minutes.
 Per-case logs are kept in `build_e2e/logs/`.
 
+For a live obs-websocket 5 integration check, run the Bun test against OBS
+with the plugin loaded and an SRTLA source configured:
+
+```sh
+OBS_WEBSOCKET_URL=ws://127.0.0.1:4455 \
+OBS_WEBSOCKET_PASSWORD=your-password \
+OBS_SRTLA_SOURCE_NAME="SRTLA Source" \
+bun test test/websocket.test.ts
+```
+
+`OBS_WEBSOCKET_PASSWORD` may be omitted when authentication is disabled.
+`OBS_SRTLA_SOURCE_NAME` defaults to `SRTLA Source`. If
+`OBS_WEBSOCKET_URL` is not set, the integration tests are skipped.
+
 ## Releases
 
 `.github/workflows/release.yml` builds every push and pull request to `main`
