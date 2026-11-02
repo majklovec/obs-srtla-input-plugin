@@ -442,3 +442,5 @@ distributing it, include their license notices and make the libsrt source for
 the embedded release available. `cmake --install` and the Windows installer
 place the srtla, spdlog, libsrt and (Windows) wepoll license texts in the
 plugin's data directory under `licenses/`.
+
+x
