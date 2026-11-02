@@ -159,8 +159,11 @@ jobs:
                   )
                   [[ -n "$OBS_CMAKE_OPTIONS" ]] || { echo "OBS development action did not provide CMake options" >&2; exit 1; }
                   read -r -a obs_cmake_options <<< "$OBS_CMAKE_OPTIONS"
+                  # The prebuilt OBS 31 devel package ships libobs.framework in the
+                  # RelWithDebInfo configuration only; linking it under any other
+                  # --config fails with "no such file or directory: .../Release/libobs.framework/...".
                   cmake "${cmake_args[@]}" "${obs_cmake_options[@]}"
-                  cmake --build build --config Release --parallel
+                  cmake --build build --config RelWithDebInfo --parallel
                   plugin="$(find build -type d -name obs-srtla-source.plugin -print -quit)"
                   [[ -n "$plugin" ]] || { echo "The build did not produce obs-srtla-source.plugin" >&2; exit 1; }
                   test -f "$plugin/Contents/MacOS/obs-srtla-source"
@@ -170,7 +173,8 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
-                  cmake --install build --config Release --prefix staging
+                  # Must match the --config used in Build (macOS) above.
+                  cmake --install build --config RelWithDebInfo --prefix staging
                   plugin=staging/obs-srtla-source.plugin
                   licenses=staging/share/obs/obs-plugins/obs-srtla-source/licenses
                   test -d "$plugin/Contents/Resources/locale"
