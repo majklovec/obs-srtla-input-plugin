@@ -57,8 +57,12 @@ HARNESS="$WORK_DIR/harness"
 if [[ ! -x "$HARNESS" || "$TEST_DIR/harness.cpp" -nt "$HARNESS" ]]; then
 	printf 'Building test harness...\n'
 	# -rdynamic lets the plugin bind to the harness's obs_source_output_* overrides.
+	# Use only the -I flags from libobs.pc: its Cflags also carry C-only build
+	# options (e.g. -std=gnu17 -Werror) that the C++ compiler rejects, and the
+	# OBS headers live under <includedir>/obs, which the .pc does not export.
 	# shellcheck disable=SC2046
-	g++ -std=c++17 -O2 -rdynamic $(pkg-config --cflags libobs) "$TEST_DIR/harness.cpp" \
+	g++ -std=c++17 -O2 -rdynamic $(pkg-config --cflags-only-I libobs) \
+		-I"$(pkg-config --variable=includedir libobs)/obs" "$TEST_DIR/harness.cpp" \
 		-o "$HARNESS" $(pkg-config --libs libobs) -ldl -pthread
 fi
 
