@@ -104,9 +104,12 @@ make_clip() {
 
 make_clip h264-aac-stereo 1920x1080 48000 \
 	-c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -ac 2
+# HLG tags go before -i: the ffmpeg libx265 wrapper (>=8) drops output-level
+# -color_* but propagates input-frame color tags into the HEVC VUI. testsrc2
+# has no color metadata, so the tags must be applied to the source.
 make_clip hevc10-hlg-aac51 1920x1080 48000 \
-	-c:v libx265 -preset ultrafast -x265-params log-level=error -pix_fmt yuv420p10le \
 	-color_trc arib-std-b67 -colorspace bt2020nc -color_primaries bt2020 \
+	-c:v libx265 -preset ultrafast -x265-params log-level=error -pix_fmt yuv420p10le \
 	-c:a aac -af "aformat=channel_layouts=5.1"
 make_clip h264-422-mp2-mono 1280x720 48000 \
 	-c:v libx264 -preset veryfast -pix_fmt yuv422p -c:a mp2 -ac 1
