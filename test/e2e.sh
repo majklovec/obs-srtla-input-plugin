@@ -90,13 +90,28 @@ fi
 echo 127.0.0.1 >"$WORK_DIR/sender_ips"
 
 # --- clips -----------------------------------------------------------------
+# make_clip NAME SIZE RATE INPUT_OPTS... OUTPUT_OPTS...
+# INPUT_OPTS must come before the -i inputs: the ffmpeg libx265 wrapper (>=8)
+# drops output-level -color_* but propagates input-frame color tags into the
+# HEVC VUI. testsrc2 carries no color metadata, so the HLG tags are applied
+# to the source. Empty INPUT_OPTS is fine for clips that need no color tags.
 make_clip() {
 	local name=$1 size=$2 rate=$3
 	shift 3
+	# Count INPUT_OPTS: it is a flat list of -opt value pairs, so take a fixed
+	# number of leading tokens. We use a marker convention: the first OUTPUT_OPT
+	# (-c:) signals the end of INPUT_OPTS.
+	local input_opts=()
+	while [[ $# -gt 0 ]]; do
+		case "$1" in -c:*) break;; esac
+		input_opts+=("$1"); shift
+	done
 	local clip="$WORK_DIR/clips/$name.ts"
 	[[ -f "$clip" ]] && return
 	printf 'Generating clip %s...\n' "$name"
+	# shellcheck disable=SC2046
 	ffmpeg -hide_banner -loglevel error -y \
+		$(printf '%s\n' "${input_opts[@]}") \
 		-f lavfi -i "testsrc2=size=$size:rate=$FPS" \
 		-f lavfi -i "sine=frequency=440:sample_rate=$rate" \
 		-t "$CLIP_SECONDS" -g "$FPS" "$@" -f mpegts "$clip"
@@ -104,9 +119,6 @@ make_clip() {
 
 make_clip h264-aac-stereo 1920x1080 48000 \
 	-c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -ac 2
-# HLG tags go before -i: the ffmpeg libx265 wrapper (>=8) drops output-level
-# -color_* but propagates input-frame color tags into the HEVC VUI. testsrc2
-# has no color metadata, so the tags must be applied to the source.
 make_clip hevc10-hlg-aac51 1920x1080 48000 \
 	-color_trc arib-std-b67 -colorspace bt2020nc -color_primaries bt2020 \
 	-c:v libx265 -preset ultrafast -x265-params log-level=error -pix_fmt yuv420p10le \
