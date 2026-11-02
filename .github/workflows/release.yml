@@ -203,12 +203,14 @@ jobs:
                   mkdir -p "$plugin/bin/64bit" "$plugin/data"
                   cp build/obs-srtla-source.so "$plugin/bin/64bit/"
                   cp -r staging/share/obs/obs-plugins/obs-srtla-source/. "$plugin/data/"
-                  archive="${{ matrix.artifact }}-$PLUGIN_VERSION.tar.gz"
-                  tar -czf "$archive" -C package obs-srtla-source
-                  tar -tzf "$archive"
-                  tar -tzf "$archive" | grep -q 'bin/64bit/obs-srtla-source.so$'
-                  tar -tzf "$archive" | grep -q 'data/locale/en-US.ini$'
-                  mkdir -p dist && mv "$archive" dist/
+                  archive="dist/${{ matrix.artifact }}-$PLUGIN_VERSION.tar.gz"
+                  mkdir -p dist
+                  tar -czf "$archive" -C "$(pwd)/package" obs-srtla-source
+                  # List into a variable before grepping: `tar | grep -q` exits
+                  # early and, under pipefail, the still-writing tar dies on EPIPE.
+                  contents="$(tar -tzf "$archive")"
+                  grep -q 'bin/64bit/obs-srtla-source.so$' <<< "$contents"
+                  grep -q 'data/locale/en-US.ini$' <<< "$contents"
 
             - name: Install NSIS (Windows)
               if: matrix.platform == 'windows'

@@ -171,6 +171,19 @@ static inline int srtla_socket_interrupted(void)
 #endif
 }
 
+/* Text for a getaddrinfo() failure code. Windows' gai_strerror() returns
+ * wchar_t*, which fmt/spdlog reject at compile time, so emit a C string there. */
+static inline const char *srtla_gai_strerror(int err)
+{
+#ifdef _WIN32
+	static char buffer[128];
+	snprintf(buffer, sizeof(buffer), "getaddrinfo error %d", err);
+	return buffer;
+#else
+	return gai_strerror(err);
+#endif
+}
+
 /* Text for the last socket error. Uses a static buffer on Windows, like
  * upstream's print_addr(); do not keep the pointer across calls. */
 static inline const char *srtla_socket_strerror(void)
